@@ -834,6 +834,8 @@ interface RequestContext {
   userAgent?: string;
   /** x-app header from incoming request (needed for OAuth passthrough) */
   xApp?: string;
+  /** All incoming headers except hop-by-hop ones (for full passthrough) */
+  allHeaders?: Record<string, string>;
 }
 
 /**
@@ -1439,7 +1441,7 @@ export function classifyComplexity(messages: Array<{ role?: string; content?: un
   const allText = extractMessageText(messages);
   const totalTokens = Math.ceil(allText.length / 4);
   // Context size floor — use as a hard signal regardless of last-message score
-  if (totalTokens > 100000) score += 5;      // definitely complex
+  if (totalTokens > 80000) score += 5;       // definitely complex (~23K system/tools not counted by scorer)
   else if (totalTokens > 50000) score += 3;  // likely moderate+
   else if (totalTokens > 20000) score += 2;
   // Message count signal — long conversations imply multi-step reasoning
@@ -1512,6 +1514,9 @@ function buildAnthropicHeadersWithAuth(
   isRerouted?: boolean
 ): Record<string, string> {
   const headers: Record<string, string> = {
+    // Spread all incoming headers as base (provides user-agent, x-app, and any
+    // other headers the client sent), then overlay our required fields.
+    ...(ctx.allHeaders ?? {}),
     'Content-Type': 'application/json',
     'anthropic-version': ctx.versionHeader || '2023-06-01',
   };
@@ -1553,14 +1558,6 @@ function buildAnthropicHeadersWithAuth(
     }
   }
 
-  // Pass through OAuth identity headers (required by Anthropic for OAuth token validation)
-  if (ctx.userAgent) {
-    headers['user-agent'] = ctx.userAgent;
-  }
-  if (ctx.xApp) {
-    headers['x-app'] = ctx.xApp;
-  }
-
   return headers;
 }
 
@@ -1572,6 +1569,9 @@ function buildAnthropicHeaders(
   envApiKey?: string
 ): Record<string, string> {
   const headers: Record<string, string> = {
+    // Spread all incoming headers as base (provides user-agent, x-app, and any
+    // other headers the client sent), then overlay our required fields.
+    ...(ctx.allHeaders ?? {}),
     'Content-Type': 'application/json',
     'anthropic-version': ctx.versionHeader || '2023-06-01',
   };
@@ -1611,14 +1611,6 @@ function buildAnthropicHeaders(
         delete headers['anthropic-beta'];
       }
     }
-  }
-
-  // Pass through OAuth identity headers (required by Anthropic for OAuth token validation)
-  if (ctx.userAgent) {
-    headers['user-agent'] = ctx.userAgent;
-  }
-  if (ctx.xApp) {
-    headers['x-app'] = ctx.xApp;
   }
 
   return headers;
@@ -2966,6 +2958,13 @@ class CooldownError extends Error {
  * Extract request context (auth headers) from incoming HTTP request
  */
 function extractRequestContext(req: http.IncomingMessage): RequestContext {
+  const SKIP_HEADERS = new Set(['host', 'content-length', 'connection', 'transfer-encoding']);
+  const allHeaders: Record<string, string> = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (!SKIP_HEADERS.has(key) && value !== undefined) {
+      allHeaders[key] = Array.isArray(value) ? value.join(', ') : value;
+    }
+  }
   return {
     authHeader: req.headers['authorization'] as string | undefined,
     betaHeaders: req.headers['anthropic-beta'] as string | undefined,
@@ -2973,6 +2972,7 @@ function extractRequestContext(req: http.IncomingMessage): RequestContext {
     apiKeyHeader: req.headers['x-api-key'] as string | undefined,
     userAgent: req.headers['user-agent'] as string | undefined,
     xApp: req.headers['x-app'] as string | undefined,
+    allHeaders,
   };
 }
 
@@ -5589,7 +5589,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               const providerResponse = await forwardNativeAnthropicRequest(attemptBody, ctx, modelAuth.apiKey, modelAuth.isMax, isCascadeRerouted);
               const responseData = (await providerResponse.json()) as Record<string, unknown>;
               if (!providerResponse.ok) {
-                if (proxyConfig.reliability?.cooldowns?.enabled) {
+                if (proxyConfig.reliability?.cooldowns?.enabled && providerResponse.status !== 401 && providerResponse.status !== 403) {
                   cooldownManager.recordFailure(resolved.provider, JSON.stringify(responseData));
                 }
                 throw new ProviderResponseError(providerResponse.status, responseData);
@@ -5698,7 +5698,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
           if (!providerResponse.ok) {
             const errorPayload = (await providerResponse.json()) as Record<string, unknown>;
-            if (proxyConfig.reliability?.cooldowns?.enabled) {
+            if (proxyConfig.reliability?.cooldowns?.enabled && providerResponse.status !== 401 && providerResponse.status !== 403) {
               cooldownManager.recordFailure(targetProvider, JSON.stringify(errorPayload));
             }
 
@@ -6654,7 +6654,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 effectiveCtx
               );
               if (!result.ok) {
-                if (cooldownsEnabled) {
+                if (cooldownsEnabled && result.status !== 401 && result.status !== 403) {
                   cooldownManager.recordFailure(resolved.provider, JSON.stringify(result.responseData));
                 }
                 throw new ProviderResponseError(result.status, result.responseData);
@@ -7074,7 +7074,7 @@ async function handleStreamingRequest(
 
     if (!providerResponse.ok) {
       const errorData = await providerResponse.json() as Record<string, unknown>;
-      if (cooldownsEnabled) {
+      if (cooldownsEnabled && providerResponse.status !== 401 && providerResponse.status !== 403) {
         cooldownManager.recordFailure(targetProvider, JSON.stringify(errorData));
       }
       const durationMs = Date.now() - startTime;
@@ -7323,7 +7323,7 @@ async function handleNonStreamingRequest(
     );
     responseData = result.responseData;
     if (!result.ok) {
-      if (cooldownsEnabled) {
+      if (cooldownsEnabled && result.status !== 401 && result.status !== 403) {
         cooldownManager.recordFailure(targetProvider, JSON.stringify(responseData));
       }
 
