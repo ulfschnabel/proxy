@@ -2958,7 +2958,12 @@ class CooldownError extends Error {
  * Extract request context (auth headers) from incoming HTTP request
  */
 function extractRequestContext(req: http.IncomingMessage): RequestContext {
-  const SKIP_HEADERS = new Set(['host', 'content-length', 'connection', 'transfer-encoding']);
+  // Skip hop-by-hop headers AND headers that buildAnthropicHeaders* manages explicitly
+  // (to avoid case-sensitive duplicates: e.g. 'authorization' from HTTP vs 'Authorization' from code)
+  const SKIP_HEADERS = new Set([
+    'host', 'content-length', 'connection', 'transfer-encoding',
+    'authorization', 'x-api-key', 'anthropic-beta', 'anthropic-version', 'content-type',
+  ]);
   const allHeaders: Record<string, string> = {};
   for (const [key, value] of Object.entries(req.headers)) {
     if (!SKIP_HEADERS.has(key) && value !== undefined) {
