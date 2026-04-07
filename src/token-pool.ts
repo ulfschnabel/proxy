@@ -23,7 +23,15 @@
  *    available token.
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 import { getDefaultRpm } from './provider-limits.js';
+
+/** Path to the token cache file — lives in ~/.relayplane/, never in git */
+function tokenCachePath(): string {
+  return path.join(os.homedir(), '.relayplane', 'token-cache.json');
+}
 
 export interface PoolAccountConfig {
   /** Human-readable label, e.g. "work-max" */
@@ -100,15 +108,57 @@ export class TokenPool {
   /**
    * Auto-register a token seen in an incoming Authorization header.
    * No-op if the token is already registered (from config or previous request).
+   * Persists to ~/.relayplane/token-cache.json so the pool survives restarts.
    */
   autoDetect(apiKey: string): void {
+    // Only register Anthropic tokens (sk-ant-*). Non-Anthropic keys (e.g. OpenRouter
+    // sk-or-v1-*) must never be mixed into the Anthropic pool — they will cause 401s.
     if (!apiKey || this.tokens.has(apiKey)) return;
+    if (!apiKey.startsWith('sk-ant-')) return;
     const label = `auto-${apiKey.slice(-8)}`;
     const state = this.makeState(
       { label, apiKey, priority: AUTO_DETECT_PRIORITY },
       'auto-detect',
     );
     this.tokens.set(apiKey, state);
+    this.persistAutoTokens();
+  }
+
+  /**
+   * Load auto-detected tokens from the on-disk cache.
+   * Called once at startup to restore pool state across restarts.
+   */
+  loadCachedTokens(): number {
+    try {
+      const raw = fs.readFileSync(tokenCachePath(), 'utf-8');
+      const entries = JSON.parse(raw) as Array<{ label: string; apiKey: string }>;
+      let loaded = 0;
+      for (const entry of entries) {
+        if (!entry.apiKey || this.tokens.has(entry.apiKey)) continue;
+        if (!entry.apiKey.startsWith('sk-ant-')) continue;
+        const state = this.makeState(
+          { label: entry.label, apiKey: entry.apiKey, priority: AUTO_DETECT_PRIORITY },
+          'auto-detect',
+        );
+        this.tokens.set(entry.apiKey, state);
+        loaded++;
+      }
+      return loaded;
+    } catch {
+      return 0; // file doesn't exist or is invalid — normal on first run
+    }
+  }
+
+  /** Persist all auto-detected tokens to disk */
+  private persistAutoTokens(): void {
+    const entries = Array.from(this.tokens.values())
+      .filter(t => t.source === 'auto-detect')
+      .map(t => ({ label: t.label, apiKey: t.apiKey }));
+    try {
+      fs.writeFileSync(tokenCachePath(), JSON.stringify(entries, null, 2), 'utf-8');
+    } catch {
+      // Non-fatal — cache dir might not exist yet on very first run
+    }
   }
 
   // ── Selection ─────────────────────────────────────────────────────────────
@@ -138,6 +188,18 @@ export class TokenPool {
   }
 
   // ── Recording ─────────────────────────────────────────────────────────────
+
+  /**
+   * Remove a token from the pool (e.g., expired OAuth token returning 401).
+   * Also removes from the on-disk cache so it doesn't come back on restart.
+   */
+  evict(apiKey: string): boolean {
+    const deleted = this.tokens.delete(apiKey);
+    if (deleted) {
+      this.persistAutoTokens();
+    }
+    return deleted;
+  }
 
   /**
    * Record a 429 response for the given apiKey.

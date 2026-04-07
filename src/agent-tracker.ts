@@ -74,8 +74,15 @@ export function extractSystemPromptFromBody(body: Record<string, unknown>): stri
   // Check top-level 'system' field (Anthropic native format)
   if (typeof body.system === 'string') return body.system;
   if (Array.isArray(body.system)) {
-    return (body.system as Array<{ type?: string; text?: string }>)
-      .map(p => p.type === 'text' ? (p.text ?? '') : (typeof p === 'string' ? p : ''))
+    return (body.system as Array<{ type?: string; text?: string; cache_control?: unknown }>)
+      .map(p => {
+        const text = p.type === 'text' ? (p.text ?? '') : (typeof p === 'string' ? String(p) : '');
+        // Skip CC billing/metadata headers — they contain per-request dynamic
+        // data (cch=) that would make every request look like a new agent.
+        if (text.startsWith('x-anthropic-billing-header:')) return '';
+        return text;
+      })
+      .filter(Boolean)
       .join('');
   }
   // Check messages array (OpenAI format)

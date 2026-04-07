@@ -55,6 +55,13 @@ import {
   forwardToOllamaStream,
   mapCloudModelToOllama,
   OLLAMA_DEFAULTS,
+  shouldRouteToOllamaNative,
+  resolveOllamaNativeModel,
+  forwardToOllamaNative,
+  forwardToOllamaNativeStream,
+  validateAnthropicResponse,
+  stripThinkingForOllama,
+  buildSyntheticTokenCount,
 } from './ollama.js';
 import {
   crossProviderCascade,
@@ -64,6 +71,7 @@ import {
 } from './cross-provider-cascade.js';
 import { getBudgetManager, type BudgetConfig, type SessionBudgetCheckResult } from './budget.js';
 import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
+import { convertOpenAIStreamToAnthropic } from './openai-to-anthropic-stream.js';
 import { getAlertManager, type AlertsConfig } from './alerts.js';
 import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DOWNGRADE_CONFIG } from './downgrade.js';
 import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptFromBody, renameAgent, getAgentRegistry, getAgentSummaries, updateAgentCost } from './agent-tracker.js';
@@ -85,6 +93,7 @@ import { getSessionId, upsertSession, getSessions, getActiveSessions } from './s
 import { TraceWriter, sha256Hex, defaultTracesConfig } from './trace-writer.js';
 import { getToolRouter, extractToolContext } from './tool-router.js';
 import { getTokenPool, type PoolAccountConfig } from './token-pool.js';
+import { sanitizeForModel } from './model-sanitizer.js';
 import { randomUUID } from 'node:crypto';
 const PROXY_VERSION: string = (() => {
   try {
@@ -98,6 +107,35 @@ const PROXY_VERSION: string = (() => {
 /** Returns true when the model is a Haiku variant (does not support extended thinking) */
 function isHaikuModel(model: string): boolean {
   return model.includes('haiku');
+}
+
+/**
+ * Model tier ordering: higher number = more capable/expensive.
+ * Used to prevent routing "up" — if CC asks for Sonnet, we never route to Opus.
+ * Non-Anthropic models (OpenRouter etc.) get tier 0 so they're always valid downgrades.
+ */
+function modelTier(model: string): number {
+  if (model.includes('opus')) return 3;
+  if (model.includes('sonnet')) return 2;
+  if (model.includes('haiku')) return 1;
+  return 0; // OpenRouter, Ollama, etc.
+}
+
+/**
+ * Cap a routed model so it never exceeds the tier of the originally requested model.
+ * Returns the original requested model if the routed model would be an upgrade.
+ */
+function capModelTier(
+  requestedModel: string,
+  routedModel: string,
+  routedProvider: Provider,
+): { model: string; provider: Provider; capped: boolean } {
+  const requestedTier = modelTier(requestedModel);
+  const routedTier = modelTier(routedModel);
+  if (routedTier > requestedTier) {
+    return { model: requestedModel, provider: 'anthropic' as Provider, capped: true };
+  }
+  return { model: routedModel, provider: routedProvider, capped: false };
 }
 
 /** Beta flags that OAT tokens (sk-ant-oat*) do not support */
@@ -498,6 +536,7 @@ interface CascadeConfig {
 interface ComplexityConfig {
   enabled: boolean;
   simple?: string | { provider: string; model: string };
+  basic?: string | { provider: string; model: string };
   moderate?: string | { provider: string; model: string };
   complex?: string | { provider: string; model: string };
 }
@@ -650,7 +689,7 @@ interface ReliabilityConfig {
   cooldowns: CooldownConfig;
 }
 
-type Complexity = 'simple' | 'moderate' | 'complex';
+type Complexity = 'simple' | 'basic' | 'moderate' | 'complex';
 
 const UNCERTAINTY_PATTERNS = [
   /i'?m not (entirely |completely |really )?sure/i,
@@ -752,6 +791,8 @@ interface HybridAuthConfig {
   anthropicMaxToken?: string;
   /** Models that should use MAX token (e.g., ["opus", "claude-opus"]) */
   useMaxForModels?: string[];
+  /** OpenRouter API key (alternative to OPENROUTER_API_KEY env var) */
+  openrouterApiKey?: string;
 }
 
 interface RelayPlaneProxyConfigFile {
@@ -1407,7 +1448,7 @@ export function classifyComplexity(messages: Array<{ role?: string; content?: un
   const lastUserMessage = userMessages.length > 0 ? [userMessages[userMessages.length - 1]] : messages;
   const text = extractMessageText(lastUserMessage).toLowerCase();
   const tokens = Math.ceil(text.length / 4);
-  
+
   let score = 0;
   
   // Code indicators
@@ -1450,6 +1491,7 @@ export function classifyComplexity(messages: Array<{ role?: string; content?: un
 
   if (score >= 4) return 'complex';
   if (score >= 2) return 'moderate';
+  if (score >= 1) return 'basic';
   return 'simple';
 }
 
@@ -1662,19 +1704,45 @@ async function forwardToAnthropicStream(
  * Forward native Anthropic /v1/messages request (passthrough with routing)
  * Used for Claude Code direct integration
  */
-async function forwardNativeAnthropicRequest(
+export async function forwardNativeAnthropicRequest(
   body: Record<string, unknown>,
   ctx: RequestContext,
   envApiKey?: string,
   isMaxToken?: boolean,
   isRerouted?: boolean
 ): Promise<Response> {
-  const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken, isRerouted);
+  // Centralized sanitization: strip unsupported params and beta headers for target model.
+  const model = typeof body.model === 'string' ? body.model : '';
+  const token = ctx.authHeader?.replace(/^Bearer\s+/i, '') ?? ctx.apiKeyHeader ?? envApiKey ?? '';
+  const tokenType = token.startsWith('sk-ant-oat') ? 'oat' as const : 'api-key' as const;
+
+  // Log what enters sanitization — critical for diagnosing Haiku 400s
+  const _debugLog = (msg: string) => {
+    const line = `${new Date().toISOString()} ${msg}\n`;
+    try { fs.appendFileSync(path.join(os.homedir(), '.relayplane', 'sanitize-debug.log'), line); } catch {}
+  };
+  const outputConfig = body['output_config'] as Record<string, unknown> | undefined;
+  _debugLog(`[SANITIZE] model=${model} hasEffort=${'effort' in body} hasOutputConfigEffort=${!!(outputConfig && 'effort' in outputConfig)} hasThinking=${'thinking' in body} bodyKeys=[${Object.keys(body).join(',')}] betas=${ctx.betaHeaders ?? 'none'}`);
+
+  const sanitized = sanitizeForModel(body, model, ctx.betaHeaders, tokenType);
+
+  const parts: string[] = [];
+  if (sanitized.strippedParams.length > 0) parts.push(`params: ${sanitized.strippedParams.join(', ')}`);
+  if (sanitized.strippedBetas.length > 0) parts.push(`betas: ${sanitized.strippedBetas.join(', ')}`);
+  if (parts.length > 0) {
+    _debugLog(`[SANITIZE] Stripped for ${model}: ${parts.join('; ')}`);
+  }
+  _debugLog(`[SANITIZE] result: hasEffort=${'effort' in sanitized.body} hasThinking=${'thinking' in sanitized.body} betas=${sanitized.betaHeaders ?? 'none'}`);
+
+  const sanitizedCtx = sanitized.betaHeaders !== ctx.betaHeaders
+    ? { ...ctx, betaHeaders: sanitized.betaHeaders }
+    : ctx;
+  const headers = buildAnthropicHeadersWithAuth(sanitizedCtx, envApiKey, isMaxToken, isRerouted);
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers,
-    body: JSON.stringify(body),
+    body: JSON.stringify(sanitized.body),
   });
 
   return response;
@@ -2428,6 +2496,72 @@ function convertAnthropicResponse(anthropicData: AnthropicResponse): Record<stri
       prompt_tokens: anthropicData.usage?.input_tokens ?? 0,
       completion_tokens: anthropicData.usage?.output_tokens ?? 0,
       total_tokens: (anthropicData.usage?.input_tokens ?? 0) + (anthropicData.usage?.output_tokens ?? 0),
+    },
+  };
+}
+
+/**
+ * Convert an OpenAI chat completion response to Anthropic Messages format.
+ * Used when a non-Anthropic provider (OpenRouter, etc.) handles a request
+ * that originated on the /v1/messages path.
+ */
+function convertOpenAIResponseToAnthropic(
+  openaiData: Record<string, unknown>,
+  modelOverride?: string,
+): Record<string, unknown> {
+  const choices = openaiData['choices'] as Array<Record<string, unknown>> | undefined;
+  const firstChoice = choices?.[0];
+  const message = firstChoice?.['message'] as Record<string, unknown> | undefined;
+  const usage = openaiData['usage'] as Record<string, unknown> | undefined;
+
+  const content: Array<Record<string, unknown>> = [];
+
+  const textContent = message?.['content'] as string | null | undefined;
+  if (textContent) {
+    content.push({ type: 'text', text: textContent });
+  }
+
+  const toolCalls = message?.['tool_calls'] as Array<Record<string, unknown>> | undefined;
+  if (toolCalls && toolCalls.length > 0) {
+    for (const tc of toolCalls) {
+      const fn = tc['function'] as Record<string, unknown> | undefined;
+      if (fn) {
+        let input: unknown;
+        try {
+          input = JSON.parse(fn['arguments'] as string);
+        } catch {
+          input = {};
+        }
+        content.push({
+          type: 'tool_use',
+          id: (tc['id'] as string) || `toolu_${Date.now()}`,
+          name: fn['name'] as string,
+          input,
+        });
+      }
+    }
+  }
+
+  const finishReason = firstChoice?.['finish_reason'] as string | undefined;
+  let stopReason = 'end_turn';
+  if (finishReason === 'tool_calls' || finishReason === 'function_call') {
+    stopReason = 'tool_use';
+  } else if (finishReason === 'length') {
+    stopReason = 'max_tokens';
+  } else if (finishReason === 'stop') {
+    stopReason = 'end_turn';
+  }
+
+  return {
+    id: (openaiData['id'] as string) || `msg_${Date.now()}`,
+    type: 'message',
+    role: 'assistant',
+    model: modelOverride ?? (openaiData['model'] as string) ?? 'unknown',
+    content,
+    stop_reason: stopReason,
+    usage: {
+      input_tokens: (usage?.['prompt_tokens'] as number) ?? 0,
+      output_tokens: (usage?.['completion_tokens'] as number) ?? 0,
     },
   };
 }
@@ -3219,7 +3353,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 </div>
 <div class="section collapsible collapsed" id="token-pool-section"><h2>Token Pool</h2><div id="token-pool-panel"></div></div>
 <div class="section"><h2>Recent Runs <span id="historyLabel" style="font-size:.75rem;color:#64748b;font-weight:400">(7d window, history-capped)</span></h2>
-<table><thead><tr><th>Time</th><th>Agent</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th class="col-cache">Cache Create</th><th class="col-cache">Cache Read</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
+<table><thead><tr><th>Time</th><th>Agent</th><th>Requested</th><th>Routed To</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th class="col-cache">Cache Create</th><th class="col-cache">Cache Read</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
 <script>
 const $ = id => document.getElementById(id);
 function esc(s){if(!s)return'';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
@@ -3323,9 +3457,11 @@ async function load(){
     $('runs').innerHTML=(runsR.runs||[]).map((r,i)=>{
       function errBadge(r){if(r.status==='success')return '<span class="badge ok">success</span>';var cls='err';var label=r.error||'error';if(r.statusCode===401||r.statusCode===403||(r.error&&/auth/i.test(r.error)))cls='err-auth';else if(r.statusCode===429||(r.error&&/rate.?limit/i.test(r.error)))cls='err-rate';else if(r.error&&/timeout/i.test(r.error))cls='err-timeout';return '<span class="badge '+cls+'" title="'+esc(r.error||'')+' (HTTP '+( r.statusCode||'?')+')">'+(r.statusCode?r.statusCode+' ':'')+ (label.length>40?label.slice(0,40)+'…':label)+'</span>';}
       const agentName=agents.find(a=>a.fingerprint===r.agentFingerprint)?.name||(r.agentId||'—');
-      const row='<tr style="cursor:pointer" onclick="toggleDetail('+i+')"><td><span id="arrow-'+i+'" style="color:#64748b;font-size:.7rem;margin-right:6px">▶</span>'+fmtTime(r.started_at)+'</td><td style="font-size:.85rem">'+esc(agentName)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td class="col-cache" style="color:#60a5fa">'+(r.cacheCreationTokens||0)+'</td><td class="col-cache" style="color:#34d399">'+(r.cacheReadTokens||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td>'+errBadge(r)+'</td></tr>';
+      const wasRerouted=r.original_model&&r.original_model!=='unknown'&&r.original_model!==r.model;
+      const routedStyle=wasRerouted?' style="color:#f59e0b"':'';
+      const row='<tr style="cursor:pointer" onclick="toggleDetail('+i+')"><td><span id="arrow-'+i+'" style="color:#64748b;font-size:.7rem;margin-right:6px">▶</span>'+fmtTime(r.started_at)+'</td><td style="font-size:.85rem">'+esc(agentName)+'</td><td>'+(r.original_model||r.model)+'</td><td'+routedStyle+'>'+(wasRerouted?r.provider+'/'+r.model:'—')+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td class="col-cache" style="color:#60a5fa">'+(r.cacheCreationTokens||0)+'</td><td class="col-cache" style="color:#34d399">'+(r.cacheReadTokens||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td>'+errBadge(r)+'</td></tr>';
       const c=r.requestContent||{};
-      let detail='<tr id="run-detail-'+i+'" style="display:none"><td colspan="12" style="padding:16px;background:#111217;border-bottom:1px solid #1e293b">';
+      let detail='<tr id="run-detail-'+i+'" style="display:none"><td colspan="13" style="padding:16px;background:#111217;border-bottom:1px solid #1e293b">';
       if(c.systemPrompt||c.userMessage||c.responsePreview){
         if(c.systemPrompt) detail+='<div style="color:#64748b;font-size:.85rem;margin-bottom:10px;font-style:italic"><strong style="color:#94a3b8">System:</strong> '+esc(c.systemPrompt)+'</div>';
         if(c.userMessage) detail+='<div style="background:#1a1c23;border:1px solid #1e293b;border-radius:8px;padding:12px;margin-bottom:10px"><strong style="color:#94a3b8;font-size:.8rem">User Message</strong><div style="margin-top:6px;white-space:pre-wrap">'+esc(c.userMessage)+'</div></div>';
@@ -3337,7 +3473,7 @@ async function load(){
       }
       detail+='</td></tr>';
       return row+detail;
-    }).join('')||'<tr><td colspan=12 style="color:#64748b">No runs yet</td></tr>';
+    }).join('')||'<tr><td colspan=13 style="color:#64748b">No runs yet</td></tr>';
     restoreExpanded();
     $('agents').innerHTML=agents.length?agents.map(a=>
       '<tr><td><span class="agent-name" data-fp="'+a.fingerprint+'">'+esc(a.name)+'</span> <button class="rename-btn" onclick="renameAgent(&quot;'+a.fingerprint+'&quot;,&quot;'+a.name.replace(/"/g,'')+'&quot;)">✏️</button></td><td>'+a.totalRequests+'</td><td>$'+fmt(a.totalCost,4)+'</td><td>'+fmtTime(a.lastSeen)+'</td><td style="font-size:.7rem;color:#64748b" title="'+esc(a.systemPromptPreview||'')+'">'+a.fingerprint+'</td></tr>'
@@ -3742,6 +3878,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       getTokenPool().registerConfigAccounts(poolAccounts);
       console.log(`[RelayPlane] Token pool: ${anthropicAccounts.length} configured account(s) registered`);
     }
+    // Load cached auto-detected tokens from prior sessions
+    const cachedCount = getTokenPool().loadCachedTokens();
+    if (cachedCount > 0) {
+      console.log(`[RelayPlane] Token pool: ${cachedCount} cached token(s) restored from disk`);
+    }
   }
 
   // === Ollama provider initialization ===
@@ -3960,6 +4101,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     downgradeConfig = { ...DEFAULT_DOWNGRADE_CONFIG, ...(proxyConfig.downgrade ?? {}) };
     _activeOllamaConfig = proxyConfig.ollama;
     clearOllamaHealthCache(); // Invalidate cached health on config change
+    // Sync provider API keys from config into env vars so resolveProviderApiKey picks them up.
+    // resolveProviderApiKey only checks env vars; config.auth.* keys must be mirrored here.
+    if (proxyConfig.auth?.openrouterApiKey) {
+      process.env['OPENROUTER_API_KEY'] = proxyConfig.auth.openrouterApiKey;
+    }
     log(`Reloaded config from ${configPath}`);
   };
 
@@ -4115,6 +4261,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             modelCounts: globalStats.modelCounts,
           })
         );
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/control/config') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(proxyConfig));
         return;
       }
 
@@ -5021,20 +5173,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     // Determine which Anthropic auth to use based on mode.
-    // When the token pool has registered accounts, select the best token from
-    // the pool and use it as the effective key (overrides env and passthrough).
+    // Session's own OAT works for all Anthropic models — no pool override needed.
+    const _incomingToken = ctx.authHeader?.replace(/^Bearer\s+/i, '') ?? ctx.apiKeyHeader;
     let useAnthropicEnvKey: string | undefined;
-    let _poolSelectedToken: string | undefined; // tracks the token chosen from the pool for this request
-    if (getTokenPool().size() > 0) {
-      const poolToken = getTokenPool().selectToken();
-      if (poolToken) {
-        _poolSelectedToken = poolToken.apiKey;
-        useAnthropicEnvKey = poolToken.apiKey;
-      } else {
-        // All tokens exhausted — fall back to normal resolution
-        useAnthropicEnvKey = anthropicAuthMode === 'passthrough' ? undefined : anthropicEnvKey;
-      }
-    } else if (anthropicAuthMode === 'env') {
+    // Auto-detect incoming token into the pool (for rate-limit tracking/status)
+    if (_incomingToken) {
+      getTokenPool().autoDetect(_incomingToken);
+    }
+    if (anthropicAuthMode === 'env') {
       useAnthropicEnvKey = anthropicEnvKey;
     } else if (anthropicAuthMode === 'passthrough') {
       useAnthropicEnvKey = undefined; // Only use incoming auth
@@ -5180,8 +5326,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // even when the user sends a specific model like "claude-opus-4-6".
       // This is the core UX: user flips routing.mode to "auto" and the proxy handles the rest.
       if (routingMode === 'passthrough' && (proxyConfig.routing?.mode === 'auto' || proxyConfig.routing?.mode === 'complexity' || proxyConfig.routing?.mode === 'cascade')) {
-        routingMode = 'auto';
-        log(`Config routing.mode=${proxyConfig.routing?.mode}: overriding passthrough → auto for model ${requestedModel}`);
+        // Haiku requests are intentionally cheap sub-agent tasks (web fetch, plan naming, etc.).
+        // Don't reroute them — Claude Code chose Haiku deliberately. Rerouting to Sonnet/Opus
+        // is wasteful and defeats the purpose of the lightweight agent model.
+        if (isHaikuModel(requestedModel)) {
+          log(`Haiku passthrough: ${requestedModel} kept as-is (small model respected)`);
+        } else {
+          routingMode = 'auto';
+          log(`Config routing.mode=${proxyConfig.routing?.mode}: overriding passthrough → auto for model ${requestedModel}`);
+        }
       }
 
       const isStreaming = requestBody['stream'] === true;
@@ -5202,6 +5355,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 cacheUsage?.output_tokens ?? 0
               );
               responseCache.recordHit(cacheCost, 0);
+              // Derive routing metadata from cached response for header replay
+              const cachedModel = (cachedData as Record<string, unknown>)['model'] as string | undefined;
+              const cachedProvider = cachedModel?.startsWith('claude-') ? 'anthropic'
+                : cachedModel?.includes('/') ? cachedModel.split('/')[0]
+                : 'anthropic';
+              const cacheRpHeaders = buildRelayPlaneResponseHeaders(
+                cachedModel ?? requestedModel, originalModel ?? 'unknown', 'cached', cachedProvider, 'cached'
+              );
               // Replay cached streaming response as SSE
               if (isStreaming && cachedData._relayplaneStreamCache) {
                 res.writeHead(200, {
@@ -5209,12 +5370,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                   'Cache-Control': 'no-cache',
                   'Connection': 'keep-alive',
                   'X-RelayPlane-Cache': 'HIT',
+                  ...cacheRpHeaders,
                 });
                 res.end(cachedData.ssePayload);
               } else {
                 res.writeHead(200, {
                   'Content-Type': 'application/json',
                   'X-RelayPlane-Cache': 'HIT',
+                  ...cacheRpHeaders,
                 });
                 res.end(cached);
               }
@@ -5336,13 +5499,24 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
 
         const resolved = resolveConfigModel(selectedModel);
-        if (!resolved || resolved.provider !== 'anthropic') {
+        if (!resolved) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Resolved model is not supported for /v1/messages' }));
+          res.end(JSON.stringify({ error: 'Failed to resolve config model' }));
           return;
         }
         targetProvider = resolved.provider;
         targetModel = resolved.model;
+      }
+
+      // Never route UP — if CC asks for Sonnet, don't give it Opus.
+      // Cap the routed model at the tier of the originally requested model.
+      if (routingMode !== 'passthrough' && originalModel && targetModel) {
+        const capped = capModelTier(originalModel, targetModel, targetProvider);
+        if (capped.capped) {
+          log(`Model tier cap: ${targetModel} exceeds requested ${originalModel} — capping to ${capped.model}`);
+          targetModel = capped.model;
+          targetProvider = capped.provider;
+        }
       }
 
       // Guard: Sonnet has a 200K standard context window. Requests larger than that
@@ -5365,20 +5539,98 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
       }
 
-      // Strip 1M context beta header when routing to Sonnet.
-      // Sonnet 1M requires "extra usage" on Max plan; without it Anthropic rejects the request.
-      // Opus 1M is included in Max plan. Stripping the beta falls back to Sonnet's 200K window.
-      let effectiveCtx = ctx;
-      if (targetModel.includes('sonnet') && ctx.betaHeaders?.includes('context-1m')) {
-        effectiveCtx = {
-          ...ctx,
-          betaHeaders: ctx.betaHeaders
-            .split(',')
-            .map(b => b.trim())
-            .filter(b => !b.startsWith('context-1m'))
-            .join(',') || undefined,
-        };
-        log(`Stripped 1M context beta from Sonnet request (requires extra usage on Max plan)`);
+      // Beta/param sanitization is handled centrally in forwardNativeAnthropicRequest
+      // via sanitizeForModel(). No inline stripping needed here.
+      const effectiveCtx = ctx;
+
+      // ── Ollama native routing: intercept before cloud dispatch ──
+      if (
+        !useCascade &&
+        _activeOllamaConfig &&
+        shouldRouteToOllamaNative(_activeOllamaConfig, complexity, requestedModel)
+      ) {
+        const ollamaModel = resolveOllamaNativeModel(_activeOllamaConfig, requestedModel);
+        const ollamaBaseUrl = _activeOllamaConfig.baseUrl ?? OLLAMA_DEFAULTS.baseUrl;
+        const ollamaStartTime = Date.now();
+        log(`Ollama native routing: ${requestedModel} → ${ollamaModel} (complexity: ${complexity})`);
+
+        // Strip thinking — Ollama models don't support extended thinking
+        let ollamaBody = stripThinkingForOllama({ ...requestBody, model: ollamaModel });
+
+        // Check Ollama health before attempting
+        const health = await checkOllamaHealthCached(ollamaBaseUrl);
+        if (health.available) {
+          try {
+            if (isStreaming) {
+              // Streaming: pipe Ollama's Anthropic-format SSE directly to client
+              const streamResult = await forwardToOllamaNativeStream(ollamaBody, {
+                baseUrl: ollamaBaseUrl,
+                timeoutMs: _activeOllamaConfig.timeoutMs ?? OLLAMA_DEFAULTS.timeoutMs,
+              });
+              if (streamResult.success && streamResult.response) {
+                const ollamaRes = streamResult.response;
+                const streamHeaders: Record<string, string> = {
+                  'Content-Type': ollamaRes.headers.get('content-type') || 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  'Connection': 'keep-alive',
+                  'X-RelayPlane-Provider': 'ollama',
+                  'X-RelayPlane-Model': ollamaModel,
+                  'X-RelayPlane-Original-Model': originalModel ?? 'unknown',
+                };
+                res.writeHead(200, streamHeaders);
+                if (ollamaRes.body) {
+                  const reader = ollamaRes.body.getReader();
+                  try {
+                    while (true) {
+                      const { done, value } = await reader.read();
+                      if (done) break;
+                      res.write(value);
+                    }
+                  } finally {
+                    reader.releaseLock();
+                  }
+                }
+                res.end();
+                const durationMs = Date.now() - ollamaStartTime;
+                log(`Ollama native stream completed in ${durationMs}ms (model: ${ollamaModel})`);
+                return;
+              }
+              // Stream failed — fall through to cloud
+              log(`Ollama native stream failed: ${streamResult.error} — falling back to cloud`);
+            } else {
+              // Non-streaming: forward, validate, return or fallback
+              const ollamaResult = await forwardToOllamaNative(ollamaBody, {
+                baseUrl: ollamaBaseUrl,
+                timeoutMs: _activeOllamaConfig.timeoutMs ?? OLLAMA_DEFAULTS.timeoutMs,
+              });
+              if (ollamaResult.success && ollamaResult.data) {
+                const validation = validateAnthropicResponse(ollamaResult.data);
+                if (validation.valid) {
+                  const rpHeaders = {
+                    'Content-Type': 'application/json',
+                    'X-RelayPlane-Provider': 'ollama',
+                    'X-RelayPlane-Model': ollamaModel,
+                    'X-RelayPlane-Original-Model': originalModel ?? 'unknown',
+                  };
+                  res.writeHead(200, rpHeaders);
+                  res.end(JSON.stringify(ollamaResult.data));
+                  log(`Ollama native response OK in ${ollamaResult.latencyMs}ms (model: ${ollamaModel})`);
+                  return;
+                }
+                // Validation failed — fall through to cloud
+                log(`Ollama native response validation failed: ${validation.reason} — falling back to cloud`);
+              } else {
+                log(`Ollama native request failed: ${ollamaResult.error} — falling back to cloud`);
+              }
+            }
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            log(`Ollama native error: ${errMsg} — falling back to cloud`);
+          }
+        } else {
+          log(`Ollama not available: ${health.error} — falling back to cloud`);
+        }
+        // Fall through: reset to cloud routing (original target stays as-is)
       }
 
       if (
@@ -5554,6 +5806,96 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       let _strippedThinking = false;
       let _strippedBetaFlags: string[] = [];
 
+      // ── Non-Anthropic provider dispatch (OpenRouter, etc.) ──
+      // When complexity routing resolves to a non-Anthropic provider, convert
+      // the Anthropic body to OpenAI format, dispatch, and convert back.
+      try { fs.appendFileSync(path.join(os.homedir(), '.relayplane', 'sanitize-debug.log'), `${new Date().toISOString()} [ROUTE-DEBUG] Pre-dispatch: targetProvider=${targetProvider} targetModel=${targetModel} useCascade=${useCascade} hasEffort=${'effort' in requestBody}\n`); } catch {}
+      if (targetProvider !== 'anthropic' && targetProvider !== 'ollama') {
+        const altApiKeyResult = resolveProviderApiKey(targetProvider as Provider, ctx, undefined);
+        if (altApiKeyResult.error) {
+          // No API key for this provider — fall back to Anthropic passthrough
+          log(`No API key for ${targetProvider}, falling back to Anthropic`);
+          targetProvider = 'anthropic';
+          targetModel = originalModel ?? 'claude-sonnet-4-20250514';
+        } else {
+          try {
+            const chatRequest = convertNativeAnthropicBodyToChatRequest(requestBody, targetModel);
+            log(`Non-Anthropic dispatch: ${targetProvider}/${targetModel} (complexity: ${complexity})`);
+
+            if (isStreaming) {
+              // Streaming: forward to OpenAI-compatible endpoint, convert SSE events
+              const streamResponse = await forwardToOpenAICompatibleStream(
+                chatRequest, targetModel, altApiKeyResult.apiKey!, targetProvider
+              );
+              if (streamResponse.ok && streamResponse.body) {
+                const streamRpHeaders = buildRelayPlaneResponseHeaders(
+                  targetModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
+                );
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  'Connection': 'keep-alive',
+                  ...streamRpHeaders,
+                });
+                // Convert OpenAI SSE → Anthropic SSE so Claude Code can parse it.
+                // Model masking is achieved by passing originalModel as the reported model.
+                const _nonAnthropicMsgId = `msg_${Date.now().toString(36)}`;
+                const _reportedModel = originalModel ?? requestedModel ?? targetModel;
+                const { stream: _openaiStream, getUsage: _getOpenAIUsage } =
+                  convertOpenAIStreamToAnthropic(streamResponse.body, _nonAnthropicMsgId, _reportedModel);
+                for await (const anthropicChunk of _openaiStream) {
+                  res.write(anthropicChunk);
+                }
+                res.end();
+                const _openaiUsage = _getOpenAIUsage();
+                const durationMs = Date.now() - startTime;
+                logRequest(originalModel ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, false, taskType, complexity, nativeAgentFingerprint, nativeExplicitAgentId);
+                updateLastHistoryEntry(_openaiUsage.inputTokens, _openaiUsage.outputTokens, 0, _reportedModel);
+                log(`Non-Anthropic stream completed: ${targetProvider}/${targetModel} in ${durationMs}ms`);
+                return;
+              }
+              // Stream failed — fall through to Anthropic
+              log(`Non-Anthropic stream failed (${streamResponse.status}), falling back to Anthropic`);
+              targetProvider = 'anthropic';
+              targetModel = originalModel ?? 'claude-sonnet-4-20250514';
+            } else {
+              // Non-streaming: dispatch, convert response, return
+              const altResponse = await forwardToOpenAICompatible(
+                chatRequest, targetModel, altApiKeyResult.apiKey!, targetProvider
+              );
+              if (altResponse.ok) {
+                const altData = (await altResponse.json()) as Record<string, unknown>;
+                const anthropicResponse = convertOpenAIResponseToAnthropic(altData, originalModel ?? requestedModel ?? targetModel);
+                const nonStreamRpHeaders = buildRelayPlaneResponseHeaders(
+                  targetModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
+                );
+                res.writeHead(200, {
+                  'Content-Type': 'application/json',
+                  ...nonStreamRpHeaders,
+                });
+                res.end(JSON.stringify(anthropicResponse));
+                const durationMs = Date.now() - startTime;
+                logRequest(originalModel ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, false, taskType, complexity, nativeAgentFingerprint, nativeExplicitAgentId);
+                // Extract usage from OpenAI response for history
+                const altUsage = altData.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;
+                updateLastHistoryEntry(altUsage?.prompt_tokens ?? 0, altUsage?.completion_tokens ?? 0, 0, originalModel ?? requestedModel ?? targetModel);
+                log(`Non-Anthropic response OK: ${targetProvider}/${targetModel} in ${durationMs}ms`);
+                return;
+              }
+              // Failed — fall through to Anthropic
+              log(`Non-Anthropic request failed (${altResponse.status}), falling back to Anthropic`);
+              targetProvider = 'anthropic';
+              targetModel = originalModel ?? 'claude-sonnet-4-20250514';
+            }
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            log(`Non-Anthropic dispatch error: ${errMsg}, falling back to Anthropic`);
+            targetProvider = 'anthropic';
+            targetModel = originalModel ?? 'claude-sonnet-4-20250514';
+          }
+        }
+      }
+
       try {
         if (useCascade && cascadeConfig) {
           const cascadeResult = await cascadeRequest(
@@ -5569,31 +5911,24 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               if (proxyConfig.reliability?.cooldowns?.enabled && !cooldownManager.isAvailable(resolved.provider)) {
                 throw new CooldownError(resolved.provider);
               }
-              let attemptBody: Record<string, unknown> = { ...requestBody, model: resolved.model };
-              if ((isHaikuModel(resolved.model) || isHaikuModel(requestedModel)) && 'thinking' in attemptBody) {
-                const { thinking: _t, ...rest } = attemptBody;
-                attemptBody = rest;
-                _strippedThinking = true;
-                log(`Stripped thinking from request (${resolved.model} does not support extended thinking, originally requested: ${requestedModel})`);
-              }
-              // Hybrid auth: use MAX token for Opus models, API key for others
+              const attemptBody: Record<string, unknown> = { ...requestBody, model: resolved.model };
+              // Sanitization handled centrally in forwardNativeAnthropicRequest
               const modelAuth = getAuthForModel(resolved.model, proxyConfig.auth, useAnthropicEnvKey);
               if (modelAuth.isMax) {
                 log(`Using MAX token for ${resolved.model}`);
-              }
-              // Log OAT beta flag stripping if applicable
-              const cascadeEffectiveToken = ctx.authHeader?.replace(/^Bearer\s+/i, '') ?? ctx.apiKeyHeader ?? modelAuth.apiKey ?? '';
-              const cascadeLocalStrippedBeta = cascadeEffectiveToken.startsWith('sk-ant-oat') && ctx.betaHeaders
-                ? ctx.betaHeaders.split(',').map(b => b.trim()).filter(b => OAT_UNSUPPORTED_BETA_FLAGS.has(b))
-                : [];
-              if (cascadeLocalStrippedBeta.length > 0) {
-                _strippedBetaFlags = cascadeLocalStrippedBeta;
-                log(`Stripped OAT-unsupported beta flags from request: ${cascadeLocalStrippedBeta.join(', ')}`);
               }
               const isCascadeRerouted = resolved.model !== originalModel;
               const providerResponse = await forwardNativeAnthropicRequest(attemptBody, ctx, modelAuth.apiKey, modelAuth.isMax, isCascadeRerouted);
               const responseData = (await providerResponse.json()) as Record<string, unknown>;
               if (!providerResponse.ok) {
+                if (providerResponse.status === 401 || providerResponse.status === 403) {
+                  const cascAuthToken = ctx.authHeader?.replace(/^Bearer\s+/i, '') ?? ctx.apiKeyHeader ?? modelAuth.apiKey ?? '';
+                  const cascTokenType = cascAuthToken.startsWith('sk-ant-oat') ? 'OAT' : cascAuthToken.startsWith('sk-ant-') ? 'API-key' : cascAuthToken ? 'unknown' : 'NONE';
+                  log(`[AUTH-DEBUG] CASCADE ${providerResponse.status} from ${resolved.provider}/${resolved.model}`);
+                  log(`[AUTH-DEBUG]   token: ${cascTokenType} (…${cascAuthToken.slice(-8) || 'empty'})`);
+                  log(`[AUTH-DEBUG]   betaHeaders: ${ctx.betaHeaders ?? 'none'}`);
+                  log(`[AUTH-DEBUG]   error: ${JSON.stringify(responseData)}`);
+                }
                 if (proxyConfig.reliability?.cooldowns?.enabled && providerResponse.status !== 401 && providerResponse.status !== 403) {
                   cooldownManager.recordFailure(resolved.provider, JSON.stringify(responseData));
                 }
@@ -5630,38 +5965,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           if (isRerouted) {
             log(`Rerouted: ${originalModel} → ${finalModel} (auth fallback enabled)`);
           }
-          // Build pool-aware context: when the pool is managing auth, clear incoming
-          // auth headers so buildAnthropicHeadersWithAuth uses the pool token instead.
-          const _nativeReqCtx: RequestContext = _poolSelectedToken
-            ? { ...effectiveCtx, authHeader: undefined, apiKeyHeader: undefined }
-            : effectiveCtx;
+          // Session's own OAT works for all Anthropic models (Haiku, Sonnet, Opus).
+          // No pool token needed — just pass through the session's auth as-is.
+          // The token pool is only used for headless/env-key scenarios, not rerouting.
+          const _nativeReqCtx: RequestContext = effectiveCtx;
 
-          // Strip thinking from body when routing to (or from) Haiku models.
-          // Haiku does not support extended thinking. Also strip when the original
-          // requested model was Haiku but routing.mode overrode it to a different
-          // model — the user's intent was a non-thinking model, so thinking params
-          // (which may also be malformed, e.g. budget_tokens < 1024) should be dropped.
-          let _nativeReqBody: Record<string, unknown> = { ...requestBody, model: finalModel };
-          if ((isHaikuModel(finalModel) || isHaikuModel(requestedModel)) && 'thinking' in _nativeReqBody) {
-            const { thinking: _t, ...rest } = _nativeReqBody;
-            _nativeReqBody = rest;
-            _strippedThinking = true;
-            log(`Stripped thinking from request (${finalModel} does not support extended thinking, originally requested: ${requestedModel})`);
-          }
-
-          // Log OAT beta flag stripping if applicable
-          const _nativeEffectiveToken = _poolSelectedToken
-            || effectiveCtx.authHeader?.replace(/^Bearer\s+/i, '')
-            || effectiveCtx.apiKeyHeader
-            || modelAuth.apiKey
-            || '';
-          const _nativeStrippedBeta = _nativeEffectiveToken.startsWith('sk-ant-oat') && effectiveCtx.betaHeaders
-            ? effectiveCtx.betaHeaders.split(',').map(b => b.trim()).filter(b => OAT_UNSUPPORTED_BETA_FLAGS.has(b))
-            : [];
-          if (_nativeStrippedBeta.length > 0) {
-            _strippedBetaFlags = _nativeStrippedBeta;
-            log(`Stripped OAT-unsupported beta flags from request: ${_nativeStrippedBeta.join(', ')}`);
-          }
+          // Sanitization handled centrally in forwardNativeAnthropicRequest
+          const _nativeReqBody: Record<string, unknown> = { ...requestBody, model: finalModel };
+          try { fs.appendFileSync(path.join(os.homedir(), '.relayplane', 'sanitize-debug.log'), `${new Date().toISOString()} [ROUTE-DEBUG] Entering gateway: model=${finalModel} hasEffort=${'effort' in _nativeReqBody} isRerouted=${isRerouted}\n`); } catch {}
 
           let providerResponse = await forwardNativeAnthropicRequest(
             _nativeReqBody,
@@ -5671,38 +5982,26 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             isRerouted
           );
 
-          // Token pool: on 429, record and retry with next available token
-          if (providerResponse.status === 429 && _poolSelectedToken) {
-            const _poolRetryAfterHeader = providerResponse.headers.get('retry-after');
-            const _poolRetryAfterS = _poolRetryAfterHeader ? parseInt(_poolRetryAfterHeader, 10) : undefined;
-            getTokenPool().record429(
-              _poolSelectedToken,
-              _poolRetryAfterS !== undefined && !isNaN(_poolRetryAfterS) ? _poolRetryAfterS : undefined,
-            );
-            const _nextPoolToken = getTokenPool().selectToken();
-            if (_nextPoolToken) {
-              log(`[TokenPool] 429 on token …${_poolSelectedToken.slice(-8)} — retrying with "${_nextPoolToken.label}"`);
-              _poolSelectedToken = _nextPoolToken.apiKey;
-              const _retryCtx: RequestContext = { ...ctx, authHeader: undefined, apiKeyHeader: undefined };
-              providerResponse = await forwardNativeAnthropicRequest(
-                _nativeReqBody,
-                _retryCtx,
-                _nextPoolToken.apiKey,
-                _nextPoolToken.isOat,
-                isRerouted
-              );
-            }
-          }
-
-          // Token pool: learn rate limits from upstream response headers
-          if (_poolSelectedToken && providerResponse.ok) {
-            const _upstreamHeaders: Record<string, string | undefined> = {};
-            providerResponse.headers.forEach((v, k) => { _upstreamHeaders[k] = v; });
-            getTokenPool().recordResponseHeaders(_poolSelectedToken, _upstreamHeaders);
-          }
-
           if (!providerResponse.ok) {
             const errorPayload = (await providerResponse.json()) as Record<string, unknown>;
+
+            // Debug: log auth details on 401/403 to diagnose proxy auth issues
+            if (providerResponse.status === 401 || providerResponse.status === 403) {
+              const authToken = effectiveCtx.authHeader?.replace(/^Bearer\s+/i, '') ?? effectiveCtx.apiKeyHeader ?? '';
+              const tokenType = authToken.startsWith('sk-ant-oat') ? 'OAT' : authToken.startsWith('sk-ant-') ? 'API-key' : authToken ? 'unknown' : 'NONE';
+              const tokenSuffix = authToken ? `…${authToken.slice(-8)}` : 'empty';
+              log(`[AUTH-DEBUG] ${providerResponse.status} from ${targetProvider}/${targetModel}`);
+              log(`[AUTH-DEBUG]   token: ${tokenType} (${tokenSuffix})`);
+              log(`[AUTH-DEBUG]   originalModel: ${originalModel}, requestedModel: ${requestedModel}`);
+              log(`[AUTH-DEBUG]   betaHeaders (original): ${ctx.betaHeaders ?? 'none'}`);
+              log(`[AUTH-DEBUG]   betaHeaders (effective): ${effectiveCtx.betaHeaders ?? 'none'}`);
+              log(`[AUTH-DEBUG]   strippedBeta: ${_strippedBetaFlags.length > 0 ? _strippedBetaFlags.join(',') : 'none'}`);
+              log(`[AUTH-DEBUG]   strippedThinking: ${_strippedThinking}`);
+              log(`[AUTH-DEBUG]   taskType: ${taskType}, complexity: ${complexity}`);
+              log(`[AUTH-DEBUG]   isRerouted: ${routingMode !== 'passthrough' && (targetModel || requestedModel) !== originalModel}`);
+              log(`[AUTH-DEBUG]   error: ${JSON.stringify(errorPayload)}`);
+            }
+
             if (proxyConfig.reliability?.cooldowns?.enabled && providerResponse.status !== 401 && providerResponse.status !== 403) {
               cooldownManager.recordFailure(targetProvider, JSON.stringify(errorPayload));
             }
@@ -5795,6 +6094,13 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             cooldownManager.recordSuccess(targetProvider);
           }
 
+          // Model masking: when the proxy reroutes a request, the upstream
+          // response will contain the actual model name (e.g. claude-sonnet-4-6).
+          // The client (Claude Code) uses the response model to determine context
+          // window limits and compaction thresholds. We rewrite it back to what
+          // the client originally requested so it behaves correctly.
+          const _maskModel = originalModel && originalModel !== (targetModel || requestedModel) ? originalModel : null;
+
           if (isStreaming) {
             const nativeStreamRpHeaders = buildRelayPlaneResponseHeaders(
               targetModel || requestedModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
@@ -5826,7 +6132,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 while (true) {
                   const { done, value } = await reader.read();
                   if (done) break;
-                  const chunk = decoder.decode(value, { stream: true });
+                  let chunk = decoder.decode(value, { stream: true });
+                  // Rewrite model name in SSE message_start event so the client
+                  // sees the originally-requested model, not the rerouted one.
+                  if (_maskModel && chunk.includes('"message_start"')) {
+                    chunk = chunk.replace(
+                      /"model"\s*:\s*"[^"]+"/,
+                      `"model":"${_maskModel}"`
+                    );
+                  }
                   res.write(chunk);
                   if (cacheHash && !cacheBypass) rawChunks.push(chunk);
                   // Parse SSE events to extract usage from message_delta / message_stop
@@ -5883,6 +6197,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             res.end();
           } else {
             nativeResponseData = await providerResponse.json() as Record<string, unknown>;
+            // Mask model in non-streaming response
+            if (_maskModel) {
+              nativeResponseData['model'] = _maskModel;
+            }
             const nativeRespModel = checkResponseModelMismatch(nativeResponseData, targetModel || requestedModel, targetProvider, log);
             const nativeRpHeaders = buildRelayPlaneResponseHeaders(
               targetModel || requestedModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
@@ -5918,7 +6236,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           true,
           routingMode,
           useCascade && cascadeConfig ? undefined : false,
-          taskType, complexity
+          taskType, complexity,
+          nativeAgentFingerprint, nativeExplicitAgentId,
         );
 
         // Always extract and persist token counts — this is what the telemetry endpoints read
@@ -6118,7 +6437,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // === Token counting endpoint ===
     if (req.method === 'POST' && url.includes('/v1/messages/count_tokens')) {
       log('Token count request');
-      
+
       if (!hasAnthropicAuth(ctx, useAnthropicEnvKey)) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Missing authentication' }));
@@ -6131,13 +6450,29 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
 
       try {
+        const parsedBody = JSON.parse(body) as Record<string, unknown>;
+        const countModel = (parsedBody['model'] as string) ?? '';
+
+        // If the model is an Ollama model, return a synthetic token count
+        // (Ollama doesn't support /v1/messages/count_tokens)
+        if (
+          _activeOllamaConfig &&
+          shouldRouteToOllamaNative(_activeOllamaConfig, 'simple', countModel)
+        ) {
+          const syntheticCount = buildSyntheticTokenCount(parsedBody);
+          log(`Synthetic token count for Ollama model ${countModel}: ${syntheticCount.input_tokens}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(syntheticCount));
+          return;
+        }
+
         const headers = buildAnthropicHeaders(ctx, useAnthropicEnvKey);
         const response = await fetch('https://api.anthropic.com/v1/messages/count_tokens', {
           method: 'POST',
           headers,
           body,
         });
-        
+
         const data = await response.json();
         res.writeHead(response.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
@@ -6358,8 +6693,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // even when the user sends a specific model like "claude-opus-4-6".
     // This is the core UX: user flips routing.mode and the proxy handles the rest.
     if (routingMode === 'passthrough' && (proxyConfig.routing?.mode === 'auto' || proxyConfig.routing?.mode === 'complexity' || proxyConfig.routing?.mode === 'cascade')) {
-      routingMode = 'auto';
-      log(`Config routing.mode=${proxyConfig.routing?.mode}: overriding passthrough → auto for model ${requestedModel}`);
+      if (isHaikuModel(requestedModel)) {
+        log(`Haiku passthrough: ${requestedModel} kept as-is (small model respected)`);
+      } else {
+        routingMode = 'auto';
+        log(`Config routing.mode=${proxyConfig.routing?.mode}: overriding passthrough → auto for model ${requestedModel}`);
+      }
     }
 
     log(`Received request for model: ${requestedModel} (mode: ${routingMode}, stream: ${isStreaming})`);
@@ -6468,6 +6807,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
     }
 
+    // Never route UP — if CC asks for Sonnet, don't give it Opus.
+    if (routingMode !== 'passthrough' && originalRequestedModel && targetModel) {
+      const capped = capModelTier(originalRequestedModel, targetModel, targetProvider);
+      if (capped.capped) {
+        log(`Model tier cap: ${targetModel} exceeds requested ${originalRequestedModel} — capping to ${capped.model}`);
+        targetModel = capped.model;
+        targetProvider = capped.provider;
+      }
+    }
+
     // Guard: Sonnet 200K context limit — upgrade to Opus for large contexts
     if (
       targetProvider === 'anthropic' &&
@@ -6485,19 +6834,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
     }
 
-    // Strip 1M context beta header when routing to Sonnet (same as native handler above)
-    let effectiveCtx = ctx;
-    if (targetModel.includes('sonnet') && ctx.betaHeaders?.includes('context-1m')) {
-      effectiveCtx = {
-        ...ctx,
-        betaHeaders: ctx.betaHeaders
-          .split(',')
-          .map(b => b.trim())
-          .filter(b => !b.startsWith('context-1m'))
-          .join(',') || undefined,
-      };
-      log(`Stripped 1M context beta from Sonnet request (requires extra usage on Max plan)`);
-    }
+    // Beta/param sanitization handled centrally in forwardNativeAnthropicRequest
+    const effectiveCtx = ctx;
 
     // ── Ollama routing: intercept before cloud dispatch ──
     if (!useCascade && _activeOllamaConfig && _activeOllamaConfig.enabled !== false) {

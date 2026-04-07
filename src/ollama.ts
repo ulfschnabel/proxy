@@ -742,3 +742,272 @@ export function mapCloudModelToOllama(
   // Fall back to default model
   return defaultModel ?? 'llama3.2';
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Native Anthropic /v1/messages passthrough for Ollama
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Validate an Anthropic Messages API response from Ollama.
+ * Returns { valid: true } or { valid: false, reason: string }.
+ *
+ * Checks: content array, block types, tool_use fields, stop_reason, role, model, usage.
+ */
+export function validateAnthropicResponse(data: unknown): { valid: boolean; reason?: string } {
+  if (!data || typeof data !== 'object') {
+    return { valid: false, reason: 'Response is not an object' };
+  }
+
+  const resp = data as Record<string, unknown>;
+
+  if (!Array.isArray(resp['content'])) {
+    return { valid: false, reason: 'Missing or non-array content field' };
+  }
+
+  for (const block of resp['content'] as Array<Record<string, unknown>>) {
+    if (!block || typeof block !== 'object') {
+      return { valid: false, reason: 'Content block is not an object' };
+    }
+    const blockType = block['type'];
+    if (typeof blockType !== 'string') {
+      return { valid: false, reason: 'Content block missing type field' };
+    }
+
+    if (blockType === 'tool_use') {
+      if (typeof block['id'] !== 'string' || !block['id']) {
+        return { valid: false, reason: 'tool_use block missing id' };
+      }
+      if (typeof block['name'] !== 'string' || !block['name']) {
+        return { valid: false, reason: 'tool_use block missing name' };
+      }
+      if (block['input'] === undefined || block['input'] === null) {
+        return { valid: false, reason: 'tool_use block missing input' };
+      }
+    } else if (blockType === 'text') {
+      if (typeof block['text'] !== 'string') {
+        return { valid: false, reason: 'text block missing text field' };
+      }
+    }
+  }
+
+  if (typeof resp['stop_reason'] !== 'string') {
+    return { valid: false, reason: 'Missing or invalid stop_reason' };
+  }
+
+  if (resp['role'] !== 'assistant') {
+    return { valid: false, reason: 'Missing or invalid role (expected "assistant")' };
+  }
+
+  if (typeof resp['model'] !== 'string') {
+    return { valid: false, reason: 'Missing model field' };
+  }
+
+  if (!resp['usage'] || typeof resp['usage'] !== 'object') {
+    return { valid: false, reason: 'Missing usage field' };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Decide whether to route a /v1/messages request to Ollama's native endpoint.
+ */
+export function shouldRouteToOllamaNative(
+  config: OllamaProviderConfig | undefined,
+  complexity: string,
+  requestedModel: string,
+): boolean {
+  if (!config || config.enabled === false) return false;
+
+  // Explicit ollama/ prefix always routes to Ollama
+  if (requestedModel.startsWith('ollama/')) return true;
+
+  // If the model name matches a configured Ollama model, route there
+  if (requestedModel && config.models?.includes(requestedModel)) return true;
+
+  // Complexity-based routing
+  if (config.routeWhen?.complexity?.includes(complexity)) return true;
+
+  return false;
+}
+
+/**
+ * Resolve which Ollama model to use for the request.
+ * - ollama/modelname → modelname
+ * - Direct model match → as-is
+ * - Complexity routing → default model or first configured model
+ */
+export function resolveOllamaNativeModel(
+  config: OllamaProviderConfig,
+  requestedModel: string,
+): string {
+  if (requestedModel.startsWith('ollama/')) {
+    return requestedModel.slice('ollama/'.length);
+  }
+  if (config.models?.includes(requestedModel)) {
+    return requestedModel;
+  }
+  return config.defaultModel ?? config.models?.[0] ?? 'llama3.2';
+}
+
+/**
+ * Strip thinking-related fields from a request body before sending to Ollama.
+ * Ollama models don't support Anthropic extended thinking.
+ */
+export function stripThinkingForOllama(body: Record<string, unknown>): Record<string, unknown> {
+  const { thinking, ...rest } = body;
+  return rest;
+}
+
+/**
+ * Build a synthetic count_tokens response.
+ * Ollama doesn't support /v1/messages/count_tokens, so we estimate.
+ */
+export function buildSyntheticTokenCount(body: Record<string, unknown>): { input_tokens: number } {
+  let totalChars = 0;
+
+  if (typeof body['system'] === 'string') {
+    totalChars += body['system'].length;
+  } else if (Array.isArray(body['system'])) {
+    for (const block of body['system'] as Array<Record<string, unknown>>) {
+      if (block['text'] && typeof block['text'] === 'string') {
+        totalChars += block['text'].length;
+      }
+    }
+  }
+
+  if (Array.isArray(body['messages'])) {
+    for (const msg of body['messages'] as Array<Record<string, unknown>>) {
+      if (typeof msg['content'] === 'string') {
+        totalChars += msg['content'].length;
+      } else if (Array.isArray(msg['content'])) {
+        for (const block of msg['content'] as Array<Record<string, unknown>>) {
+          if (typeof block['text'] === 'string') totalChars += block['text'].length;
+          if (typeof block['content'] === 'string') totalChars += block['content'].length;
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(body['tools'])) {
+    totalChars += JSON.stringify(body['tools']).length;
+  }
+
+  return { input_tokens: Math.ceil(totalChars / 4) };
+}
+
+/**
+ * Forward a non-streaming request to Ollama's native /v1/messages endpoint.
+ * Returns the raw response for validation before returning to the client.
+ */
+export async function forwardToOllamaNative(
+  body: Record<string, unknown>,
+  options?: {
+    baseUrl?: string;
+    timeoutMs?: number;
+  },
+): Promise<{
+  success: boolean;
+  status: number;
+  data?: Record<string, unknown>;
+  error?: string;
+  latencyMs: number;
+}> {
+  const baseUrl = options?.baseUrl ?? OLLAMA_DEFAULTS.baseUrl;
+  const timeoutMs = options?.timeoutMs ?? OLLAMA_DEFAULTS.timeoutMs;
+  const start = Date.now();
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      return {
+        success: false,
+        status: response.status,
+        error: `Ollama /v1/messages returned ${response.status}: ${errText}`.trim(),
+        latencyMs: Date.now() - start,
+      };
+    }
+
+    const data = (await response.json()) as Record<string, unknown>;
+    return {
+      success: true,
+      status: 200,
+      data,
+      latencyMs: Date.now() - start,
+    };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const isTimeout = errMsg.includes('abort') || errMsg.includes('AbortError');
+    return {
+      success: false,
+      status: isTimeout ? 408 : 502,
+      error: isTimeout
+        ? `Ollama request timed out after ${timeoutMs}ms`
+        : `Failed to connect to Ollama: ${errMsg}`,
+      latencyMs: Date.now() - start,
+    };
+  }
+}
+
+/**
+ * Forward a streaming request to Ollama's native /v1/messages endpoint.
+ * Returns the raw Response object so the proxy can pipe the SSE stream directly
+ * to the client (Ollama's /v1/messages streams Anthropic-format SSE natively).
+ */
+export async function forwardToOllamaNativeStream(
+  body: Record<string, unknown>,
+  options?: {
+    baseUrl?: string;
+    timeoutMs?: number;
+  },
+): Promise<{
+  success: boolean;
+  response?: Response;
+  error?: string;
+}> {
+  const baseUrl = options?.baseUrl ?? OLLAMA_DEFAULTS.baseUrl;
+  const timeoutMs = options?.timeoutMs ?? OLLAMA_DEFAULTS.timeoutMs;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, stream: true }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      return {
+        success: false,
+        error: `Ollama /v1/messages streaming returned ${response.status}: ${errText}`.trim(),
+      };
+    }
+
+    return { success: true, response };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const isTimeout = errMsg.includes('abort') || errMsg.includes('AbortError');
+    return {
+      success: false,
+      error: isTimeout
+        ? `Ollama stream timed out after ${timeoutMs}ms`
+        : `Failed to connect to Ollama for streaming: ${errMsg}`,
+    };
+  }
+}
