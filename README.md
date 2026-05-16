@@ -142,6 +142,19 @@ Client (Claude Code / Aider / Cursor)
 Provider APIs (Anthropic/OpenAI/Gemini/xAI/...)
 ```
 
+## Deployment
+
+Use the Node-based deploy entrypoint for releases and validation:
+
+```bash
+npm run deploy:validate
+npm run deploy
+npm run deploy:stage-config
+npm run deploy:rollback -- <backup-name>
+```
+
+On Windows, the deploy command manages the scheduled task and health checks for you.
+
 ## How It Works
 
 RelayPlane is a local HTTP proxy. You point your agent at `localhost:4100` by setting `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`. The proxy:

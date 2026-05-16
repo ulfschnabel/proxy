@@ -7,39 +7,21 @@
  * @packageDocumentation
  */
 
-import * as http from 'node:http';
-import { handleHealthRequest } from './health.js';
+import { startProxy } from './standalone-proxy.js';
 
 const port = parseInt(process.env['RELAYPLANE_PROXY_PORT'] ?? '4100', 10);
 const host = process.env['RELAYPLANE_PROXY_HOST'] ?? '127.0.0.1';
+const verbose = process.env['RELAYPLANE_VERBOSE'] === '1' || process.env['RELAYPLANE_VERBOSE'] === 'true';
 
-const server = http.createServer((req, res) => {
-  const pathname = (req.url ?? '').split('?')[0] ?? '';
-
-  if (req.method === 'GET' && (pathname === '/health' || pathname === '/healthz')) {
-    handleHealthRequest(res);
-    return;
-  }
-
-  // For now, all other requests get a minimal response.
-  // The full proxy logic (standalone-proxy.ts) can be wired in later.
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not found' }));
-});
-
-server.listen(port, host, () => {
+async function main() {
+  await startProxy({ port, host, verbose });
   console.log(`RelayPlane proxy launcher listening on http://${host}:${port}`);
-});
-
-// Graceful shutdown
-function shutdown() {
-  console.log('RelayPlane proxy launcher shutting down...');
-  server.close(() => {
-    process.exit(0);
-  });
-  // Force exit after 5s
-  setTimeout(() => process.exit(1), 5000).unref();
 }
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+main().catch((err) => {
+  console.error('RelayPlane proxy launcher failed:', err);
+  process.exit(1);
+});
+
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));

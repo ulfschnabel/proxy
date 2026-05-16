@@ -59,16 +59,26 @@ import {
   getTelemetryPath,
 } from './telemetry.js';
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, openSync, closeSync } from 'fs';
 import { unlinkSync } from 'fs';
 import { join, dirname, resolve } from 'path';
 import { homedir } from 'os';
 import * as net from 'net';
 import * as readline from 'readline';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
+import { ProcessManager } from './process-manager.js';
 import { getResponseCache } from './response-cache.js';
 import { getBudgetManager } from './budget.js';
 import { getAlertManager } from './alerts.js';
+
+// __dirname is available natively in CJS
+
+const DEPL_SCRIPT = join(__dirname, '..', 'scripts', 'deploy.js');
+
+function runDeployScript(args: string[]): number {
+  const result = spawnSync(process.execPath, [DEPL_SCRIPT, ...args], { stdio: 'inherit' });
+  return result.status ?? 1;
+}
 
 // __dirname is available natively in CJS
 
@@ -449,12 +459,25 @@ async function handleCloudStatusCommand(): Promise<void> {
  * Singleton guard: start the proxy if not already running on :4100, exit immediately if it is.
  * Designed for use in Claude Code SessionStart hooks — fast, idempotent, no duplicate processes.
  */
-async function handleEnsureRunning(): Promise<void> {
-  const PORT = 4100;
-  const HOST = '127.0.0.1';
+async function handleEnsureRunning(args: string[]): Promise<void> {
+  let PORT = 4100;
+  let HOST = '127.0.0.1';
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--port' && args[i + 1]) {
+      PORT = parseInt(args[i + 1]!, 10);
+      i++;
+    } else if (arg === '--host' && args[i + 1]) {
+      HOST = args[i + 1]!;
+      i++;
+    }
+  }
+
   const relayDir = join(homedir(), '.relayplane');
   const pidFile = join(relayDir, 'proxy.pid');
   const logFile = join(relayDir, 'proxy.log');
+  const supervisorLog = join(relayDir, 'supervisor.log');
 
   function isPortListening(): Promise<boolean> {
     return new Promise((resolve) => {
@@ -464,18 +487,35 @@ async function handleEnsureRunning(): Promise<void> {
     });
   }
 
-  // Fast path: already running
+  // Fast path: port already listening — proxy is up
   if (await isPortListening()) {
     console.log(`RelayPlane already running on :${PORT}`);
     return;
   }
 
-  // Clean up stale PID file
+  // Guard against duplicate supervisors: if our PID file points to a live process,
+  // a supervisor is already running (just hasn't bound the port yet). Don't spawn another.
   if (existsSync(pidFile)) {
     try {
       const stalePid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
       if (!isNaN(stalePid)) {
-        try { process.kill(stalePid, 0); } catch { unlinkSync(pidFile); }
+        try {
+          process.kill(stalePid, 0); // throws if process doesn't exist
+          // Process is alive — supervisor is already running, wait for port
+          const deadline2 = Date.now() + 5000;
+          while (Date.now() < deadline2) {
+            await new Promise((r) => setTimeout(r, 200));
+            if (await isPortListening()) {
+              console.log(`RelayPlane already running on :${PORT}`);
+              return;
+            }
+          }
+          // Still not up after 5s — supervisor may be stuck, fall through to respawn
+          console.error(`[relayplane] Supervisor pid ${stalePid} alive but port not up, respawning`);
+        } catch {
+          // Process doesn't exist — stale PID, clean it up
+          unlinkSync(pidFile);
+        }
       }
     } catch { /* best-effort */ }
   }
@@ -485,29 +525,91 @@ async function handleEnsureRunning(): Promise<void> {
     mkdirSync(relayDir, { recursive: true });
   }
 
-  // Spawn proxy as detached daemon
-  const child = spawn(process.execPath, [process.argv[1]!], {
+  // Spawn supervised proxy as detached daemon — log to supervisor.log
+  const logFd = openSync(supervisorLog, 'a');
+  const child = spawn(process.execPath, [process.argv[1]!, 'supervise', '--port', String(PORT), '--host', HOST], {
     detached: true,
-    stdio: ['ignore', 'ignore', 'ignore'],
+    windowsHide: true,
+    stdio: ['ignore', logFd, logFd],
     env: process.env,
   });
   child.unref();
+  closeSync(logFd);  // Close the fd in parent; child has its own copy
 
   const pid = child.pid!;
   writeFileSync(pidFile, String(pid));
 
-  // Poll for port to come up (up to 3s)
-  const deadline = Date.now() + 3000;
+  // Poll for port to come up (up to 5s)
+  const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 200));
     if (await isPortListening()) {
-      console.log(`RelayPlane started (pid: ${pid})`);
+      console.log(`RelayPlane started (supervisor pid: ${pid})`);
       return;
     }
   }
 
-  process.stderr.write(`Error: RelayPlane did not start within 3s (pid: ${pid}, log: ${logFile})\n`);
+  process.stderr.write(`Error: RelayPlane did not start within 5s (supervisor pid: ${pid}, log: ${logFile})\n`);
   process.exit(1);
+}
+
+async function handleSuperviseCommand(args: string[]): Promise<void> {
+  let port = 4100;
+  let host = '127.0.0.1';
+  let verbose = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--port' && args[i + 1]) {
+      port = parseInt(args[i + 1]!, 10);
+      i++;
+    } else if (arg === '--host' && args[i + 1]) {
+      host = args[i + 1]!;
+      i++;
+    } else if (arg === '-v' || arg === '--verbose') {
+      verbose = true;
+    }
+  }
+
+  const manager = new ProcessManager({
+    env: {
+      ...process.env,
+      RELAYPLANE_PROXY_PORT: String(port),
+      RELAYPLANE_PROXY_HOST: host,
+      ...(verbose ? { RELAYPLANE_VERBOSE: '1' } : {}),
+    },
+    restartDelayMs: 5_000,
+    maxRestartDelayMs: 60_000,
+    maxRestartAttempts: Number.MAX_SAFE_INTEGER,
+    restartWindowMs: 24 * 60 * 60 * 1000,
+  });
+
+  const shutdown = () => {
+    manager.destroy();
+    process.exit(0);
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  // Listen to crash events and log them with context
+  manager.on('crash', ({ code, signal }) => {
+    console.error(`[relayplane] Proxy crashed (code=${code}, signal=${signal})`);
+  });
+
+  manager.on('error', (err: Error) => {
+    console.error(`[relayplane] Manager error: ${err.message}`);
+  });
+
+  manager.on('maxRestartsExceeded', () => {
+    console.error('[relayplane] Max restart attempts exceeded. Supervisor giving up.');
+    process.exit(1);
+  });
+
+  console.log(`RelayPlane supervisor starting on http://${host}:${port}`);
+  manager.start();
+
+  await new Promise<void>(() => {});
 }
 
 function printHelp(): void {
@@ -535,9 +637,10 @@ Commands:
   alerts [list|counts]   View cost alerts and anomaly history
   cache [on|off|status|clear|stats]  Manage response cache
   service [install|uninstall|status]  Manage system service (systemd/launchd)
+  deploy [release|validate|stage-config|rollback|status]  Agent-safe deploy workflow
   autostart [on|off|status]  Manage autostart on boot (systemd, legacy)
   mesh [status|on|off|sync|contribute]  Mesh learning layer management
-  ensure-running         Start proxy if not running (idempotent, safe for hooks)
+  ensure-running         Start proxy if not running (idempotent, safe for hooks)"}յ to=functions.Edit  大发快三是什么 to=functions.Edit _植物百科通 to=functions.Edit ҙы to=functions.Edit ############### to=functions.Edit wureg to=functions.Edit ുന്നു to=functions.Edit ું to=functions.Edit 】【。 to=functions.Edit ുവരെ to=functions.Edit െട്ട to=functions.Edit ுக்க to=functions.Edit ះ to=functions.Edit ៊ to=functions.Edit ̂ to=functions.Edit ុំ to=functions.Edit ែ to=functions.Edit ႔ to=functions.Edit ୧ to=functions.Edit ៏ to=functions.Edit ៗ to=functions.Edit ႐ to=functions.Edit ოა to=functions.Edit ើ to=functions.Edit િ to=functions.Edit ူး to=functions.Edit ់ to=functions.Edit ង to=functions.Edit へ to=functions.Edit ҫ to=functions.Edit 去 to=functions.Edit ￿ to=functions.Edit ],
 
 Options:
   --port <number>    Port to listen on (default: 4100)
@@ -1094,14 +1197,179 @@ ${envDict}
 `;
 }
 
+async function handleWindowsServiceCommand(sub: string, dryRun: boolean): Promise<void> {
+  const { execSync } = require('child_process') as typeof import('child_process');
+  const TASK_NAME = 'RelayPlane Proxy';
+  const PORT = 4010;
+  const HOST = '127.0.0.1';
+  const relayDir = join(homedir(), '.relayplane');
+  const cliPath = process.argv[1]!;
+
+  const runPS = (script: string): { ok: boolean; out: string } => {
+    if (dryRun) {
+      console.log(`  [dry-run] powershell: ${script}`);
+      return { ok: true, out: '' };
+    }
+    try {
+      const out = execSync(
+        `powershell.exe -NoProfile -NonInteractive -Command "${script.replace(/"/g, '\\"')}"`,
+        { encoding: 'utf8', windowsHide: true }
+      );
+      return { ok: true, out: out ?? '' };
+    } catch (e: any) {
+      return { ok: false, out: (e.stdout ?? '') + (e.stderr ?? '') };
+    }
+  };
+
+  const runSchtasks = (args: string): { ok: boolean; out: string } => {
+    if (dryRun) {
+      console.log(`  [dry-run] schtasks ${args}`);
+      return { ok: true, out: '' };
+    }
+    try {
+      const out = execSync(`schtasks.exe ${args}`, { encoding: 'utf8', windowsHide: true });
+      return { ok: true, out: out ?? '' };
+    } catch (e: any) {
+      return { ok: false, out: (e.stdout ?? '') + (e.stderr ?? '') };
+    }
+  };
+
+  if (sub === 'install') {
+    console.log('');
+    console.log('  📋 Installing RelayPlane Proxy Windows Task Scheduler task...');
+
+    if (!existsSync(relayDir)) mkdirSync(relayDir, { recursive: true });
+
+    const TASK_NAME_LOGON = `${TASK_NAME} (Logon)`;
+    const TASK_NAME_WATCHDOG = `${TASK_NAME} (Watchdog)`;
+
+    // Task action: powershell.exe -WindowStyle Hidden launches node via Start-Process
+    // -NoNewWindow, which passes CREATE_NO_WINDOW to node — fully suppresses any console.
+    // This is more reliable than wscript+VBS (which only sets SW_HIDE, still briefly flashes).
+    const nodePathEscaped = process.execPath.replace(/'/g, "''");
+    const cliPathEscaped = cliPath.replace(/'/g, "''");
+    const psArg = `-WindowStyle Hidden -NoProfile -NonInteractive -Command "Start-Process -FilePath '${nodePathEscaped}' -ArgumentList '${cliPathEscaped}', 'ensure-running', '--port', '${PORT}', '--host', '${HOST}' -NoNewWindow -WindowStyle Hidden"`;
+
+    // Use PowerShell Register-ScheduledTask for reliable user-level task creation.
+    const psInstall = [
+      // Remove any existing tasks
+      `Unregister-ScheduledTask -TaskName '${TASK_NAME_LOGON}' -Confirm:$false -ErrorAction SilentlyContinue`,
+      `Unregister-ScheduledTask -TaskName '${TASK_NAME_WATCHDOG}' -Confirm:$false -ErrorAction SilentlyContinue`,
+      `Unregister-ScheduledTask -TaskName '${TASK_NAME.replace(/'/g, "''")}' -Confirm:$false -ErrorAction SilentlyContinue`,
+      // Execute powershell.exe -WindowStyle Hidden; Start-Process -NoNewWindow gives node CREATE_NO_WINDOW
+      `$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '${psArg.replace(/'/g, "''")}'`,
+      `$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew`,
+      // Logon trigger: -User (whoami) ensures the task fires for the current user
+      // and avoids the access-denied error when creating ONLOGON tasks without elevation
+      `$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User (whoami)`,
+      `Register-ScheduledTask -TaskName '${TASK_NAME_LOGON}' -Action $action -Trigger $logonTrigger -Settings $settings -RunLevel Limited -Force | Out-Null`,
+      // Watchdog trigger: every 5 minutes, starting now, indefinitely
+      `$watchdogTrigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Minutes 5) -Once -At (Get-Date)`,
+      `Register-ScheduledTask -TaskName '${TASK_NAME_WATCHDOG}' -Action $action -Trigger $watchdogTrigger -Settings $settings -RunLevel Limited -Force | Out-Null`,
+    ].join('; ');
+
+    const { ok: psOk, out: psOut } = runPS(psInstall);
+
+    if (!dryRun) {
+      if (psOk) {
+        console.log(`  ✅ Tasks created:`);
+        console.log(`     - "${TASK_NAME_LOGON}" (starts proxy at login)`);
+        console.log(`     - "${TASK_NAME_WATCHDOG}" (watchdog, every 5 min)`);
+        // Run the watchdog immediately so proxy comes up now
+        runSchtasks(`/Run /TN "${TASK_NAME_WATCHDOG}"`);
+        console.log(`  ▶️  Watchdog triggered — proxy will be up in a few seconds.`);
+      } else {
+        console.log(`  ⚠️  Task creation failed. PowerShell output:`);
+        psOut.split('\n').filter(l => l.trim()).forEach(l => console.log(`     ${l.trim()}`));
+        console.log(`  You can run manually: node "${cliPath}" ensure-running --port ${PORT} --host ${HOST}`);
+      }
+    }
+    console.log('');
+
+  } else if (sub === 'uninstall') {
+    const TASK_NAME_LOGON = `${TASK_NAME} (Logon)`;
+    const TASK_NAME_WATCHDOG = `${TASK_NAME} (Watchdog)`;
+    console.log('');
+    console.log('  🗑️  Removing RelayPlane Proxy Windows Task Scheduler tasks...');
+    runPS([
+      `Unregister-ScheduledTask -TaskName '${TASK_NAME_LOGON}' -Confirm:$false -ErrorAction SilentlyContinue`,
+      `Unregister-ScheduledTask -TaskName '${TASK_NAME_WATCHDOG}' -Confirm:$false -ErrorAction SilentlyContinue`,
+      `Unregister-ScheduledTask -TaskName '${TASK_NAME.replace(/'/g, "''")}' -Confirm:$false -ErrorAction SilentlyContinue`,
+    ].join('; '));
+    if (!dryRun) {
+      console.log(`  ✅ Tasks removed.`);
+    }
+    console.log('');
+
+  } else if (sub === 'status') {
+    const TASK_NAME_LOGON = `${TASK_NAME} (Logon)`;
+    const TASK_NAME_WATCHDOG = `${TASK_NAME} (Watchdog)`;
+    console.log('');
+    console.log('  📊 RelayPlane Windows Service Status');
+    console.log('  ═════════════════════════════════════');
+
+    const checkTask = (name: string): { found: boolean; status?: string; nextRun?: string } => {
+      const { ok, out } = runSchtasks(`/Query /TN "${name}" /FO LIST`);
+      if (!ok || !out) return { found: false };
+      const lines = out.split('\n').filter(l => l.trim());
+      return {
+        found: true,
+        status: lines.find(l => /^Status[\s:]/i.test(l))?.trim(),
+        nextRun: lines.find(l => /next run/i.test(l))?.trim(),
+      };
+    };
+
+    const logon = checkTask(TASK_NAME_LOGON);
+    const watchdog = checkTask(TASK_NAME_WATCHDOG);
+    const anyFound = logon.found || watchdog.found;
+
+    if (anyFound) {
+      if (logon.found) {
+        console.log(`  Logon task:    ✅ Installed`);
+        if (logon.status) console.log(`    ${logon.status}`);
+      } else {
+        console.log(`  Logon task:    ❌ Missing`);
+      }
+      if (watchdog.found) {
+        console.log(`  Watchdog task: ✅ Installed (every 5 min)`);
+        if (watchdog.status) console.log(`    ${watchdog.status}`);
+        if (watchdog.nextRun) console.log(`    ${watchdog.nextRun}`);
+      } else {
+        console.log(`  Watchdog task: ❌ Missing`);
+      }
+    } else {
+      console.log(`  Tasks:     ❌ Not installed`);
+    }
+
+    let proxyUp = false;
+    try {
+      const r = await fetch(`http://${HOST}:${PORT}/health`, { signal: AbortSignal.timeout(2000) });
+      proxyUp = r.ok;
+    } catch {}
+    console.log(`  Proxy:     ${proxyUp ? '🟢 Running' : '🔴 Stopped'} on :${PORT}`);
+
+    if (!anyFound) {
+      console.log('');
+      console.log(`  Run: node "${cliPath}" service install`);
+    }
+    console.log('');
+  }
+}
+
 async function handleServiceCommand(args: string[]): Promise<void> {
   const sub = args[0] ?? 'status';
   const dryRun = args.includes('--dry-run');
   const isMac = process.platform === 'darwin';
   const isLinux = process.platform === 'linux';
+  const isWindows = process.platform === 'win32';
+
+  if (isWindows) {
+    await handleWindowsServiceCommand(sub, dryRun);
+    return;
+  }
 
   if (!isMac && !isLinux) {
-    console.log('  ⚠️  Service management is only supported on Linux (systemd) and macOS (launchd).');
+    console.log('  ⚠️  Service management is only supported on Linux (systemd), macOS (launchd), and Windows (Task Scheduler).');
     return;
   }
 
@@ -1429,7 +1697,7 @@ async function main(): Promise<void> {
   const knownCommands = new Set([
     'init', 'start', 'telemetry', 'stats', 'config', 'login', 'logout', 'upgrade',
     'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'alerts', 'enable', 'disable',
-    'ensure-running',
+    'ensure-running', 'supervise',
   ]);
 
   if (command && !command.startsWith('-') && !knownCommands.has(command)) {
@@ -1483,6 +1751,11 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (command === 'deploy') {
+    const exitCode = runDeployScript(args.slice(1));
+    process.exit(exitCode);
+  }
+
   if (command === 'mesh') {
     await handleMeshCommand(args.slice(1));
     process.exit(0);
@@ -1514,7 +1787,12 @@ async function main(): Promise<void> {
   }
 
   if (command === 'ensure-running') {
-    await handleEnsureRunning();
+    await handleEnsureRunning(args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'supervise') {
+    await handleSuperviseCommand(args.slice(1));
     process.exit(0);
   }
 

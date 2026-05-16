@@ -28,6 +28,18 @@ import { RelayPlane, inferTaskType, getInferenceConfidence } from '@relayplane/c
 // __dirname is available natively in CJS
 import type { Provider as CoreProvider, TaskType } from '@relayplane/core';
 
+process.on('uncaughtException', (err) => {
+  console.error('[RelayPlane] Uncaught exception:', err);
+  // Exit so supervisor can restart; don't try to recover from fatal errors
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[RelayPlane] Unhandled rejection:', reason instanceof Error ? reason.stack : reason);
+  // Exit so supervisor can restart; don't try to recover from fatal errors
+  process.exit(1);
+});
+
 type Provider = CoreProvider
   | 'openrouter'
   | 'deepseek'
@@ -36,7 +48,8 @@ type Provider = CoreProvider
   | 'together'
   | 'fireworks'
   | 'perplexity'
-  | 'ollama';
+  | 'ollama'
+  | 'codex';
 import { buildModelNotFoundError } from './utils/model-suggestions.js';
 import { recordTelemetry as recordCloudTelemetry, inferTaskType as inferTelemetryTaskType, estimateCost, queueForUpload } from './telemetry.js';
 import { maybeFireActivated, maybeSendSessionHeartbeat } from './lifecycle-telemetry.js';
@@ -72,6 +85,12 @@ import {
 import { getBudgetManager, type BudgetConfig, type SessionBudgetCheckResult } from './budget.js';
 import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
 import { convertOpenAIStreamToAnthropic } from './openai-to-anthropic-stream.js';
+import {
+  forwardToResponsesAPI,
+  convertResponsesAPIStreamToAnthropic,
+  convertResponsesAPIResponseToAnthropic,
+  type AnthropicBody as CodexAnthropicBody,
+} from './codex-provider.js';
 import { getAlertManager, type AlertsConfig } from './alerts.js';
 import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DOWNGRADE_CONFIG } from './downgrade.js';
 import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptFromBody, renameAgent, getAgentRegistry, getAgentSummaries, updateAgentCost } from './agent-tracker.js';
@@ -279,6 +298,10 @@ export const DEFAULT_ENDPOINTS: Record<string, ProviderEndpoint> = {
   ollama: {
     baseUrl: 'http://localhost:11434',
     apiKeyEnv: 'OLLAMA_API_KEY', // Not actually required, placeholder for consistency
+  },
+  codex: {
+    baseUrl: 'https://chatgpt.com/backend-api/codex/responses',
+    apiKeyEnv: 'CODEX_API_KEY', // Unused; Codex uses OAuth tokens from ~/.codex/auth.json
   },
 };
 
@@ -492,6 +515,18 @@ export function resolveModelAlias(model: string): string {
 }
 
 /**
+ * When complexity routing selects an Opus model, preserve the caller's Opus version.
+ * e.g. if the caller asked for claude-opus-4-7 and routing picked claude-opus-4-6,
+ * return claude-opus-4-7 — don't silently downgrade.
+ */
+export function preserveOpusVersion(requestedModel: string, routedModel: string): string {
+  if (/^claude-opus-/.test(requestedModel) && /^claude-opus-/.test(routedModel)) {
+    return requestedModel;
+  }
+  return routedModel;
+}
+
+/**
  * Default routing based on task type.
  * Updated at proxy startup by provider auto-detection via detectAvailableProviders().
  */
@@ -541,44 +576,6 @@ interface ComplexityConfig {
   complex?: string | { provider: string; model: string };
 }
 
-/**
- * Parse a complexity routing config value into a provider/model pair.
- * Accepts:
- *   - plain model name string: "claude-sonnet-4-6"
- *   - provider/model slash notation: "google/gemini-2.5-flash-lite"
- *   - openrouter prefix: "openrouter/anthropic/claude-sonnet-4-6"
- *   - object: { provider: "google", model: "gemini-2.5-flash-lite" }
- */
-function parseComplexityModel(
-  val: string | { provider: string; model: string }
-): { provider: Provider; model: string } {
-  if (typeof val === 'object' && val !== null) {
-    const knownProviders: Provider[] = ['openai', 'anthropic', 'google', 'xai', 'openrouter', 'deepseek', 'groq', 'local', 'ollama'];
-    const p = val.provider as Provider;
-    if (!knownProviders.includes(p)) {
-      console.warn(`[parseComplexityModel] Unknown provider "${val.provider}" in object config, falling back to anthropic`);
-      return { provider: 'anthropic' as Provider, model: val.model };
-    }
-    return { provider: p, model: val.model };
-  }
-  if (typeof val === 'string') {
-    if (val.includes('/')) {
-      const idx = val.indexOf('/');
-      const rawProvider = val.slice(0, idx);
-      const model = val.slice(idx + 1); // preserves openrouter/anthropic/claude-... style
-      const knownProviders: Provider[] = ['openai', 'anthropic', 'google', 'xai', 'openrouter', 'deepseek', 'groq', 'local', 'ollama'];
-      if (!knownProviders.includes(rawProvider as Provider)) {
-        console.warn(`[parseComplexityModel] Unknown provider "${rawProvider}" in config, falling back to anthropic`);
-        return { provider: 'anthropic' as Provider, model };
-      }
-      const provider = rawProvider as Provider;
-      return { provider, model };
-    }
-    // Plain model name — look up in MODEL_MAPPING, fallback to anthropic
-    return MODEL_MAPPING[val] ?? { provider: 'anthropic' as Provider, model: val };
-  }
-  return { provider: 'anthropic' as Provider, model: 'claude-sonnet-4-6' };
-}
 
 interface ComplexityTiers {
   simple:   { provider: Provider; model: string };
@@ -667,13 +664,13 @@ function buildDefaultComplexityTiers(
   const defaults = PROVIDER_COMPLEXITY_TIERS[primaryProvider] ?? PROVIDER_COMPLEXITY_TIERS['anthropic'];
 
   const simple = existing?.simple != null
-    ? parseComplexityModel(existing.simple)
+    ? resolveModel(existing.simple) ?? defaults.simple
     : defaults.simple;
   const moderate = existing?.moderate != null
-    ? parseComplexityModel(existing.moderate)
+    ? resolveModel(existing.moderate) ?? defaults.moderate
     : defaults.moderate;
   const complex = existing?.complex != null
-    ? parseComplexityModel(existing.complex)
+    ? resolveModel(existing.complex) ?? defaults.complex
     : defaults.complex;
 
   return { simple, moderate, complex };
@@ -1440,7 +1437,7 @@ function extractMessageText(messages: Array<{ content?: unknown }>): string {
     .join(' ');
 }
 
-export function classifyComplexity(messages: Array<{ role?: string; content?: unknown }>): Complexity {
+export function classifyComplexity(messages: Array<{ role?: string; content?: unknown }>, systemText?: string): Complexity {
   // Only classify based on the last user message, not system prompts or conversation history.
   // System prompts (AGENTS.md, SOUL.md, etc.) are always huge for agent workloads and would
   // cause everything to be classified as "complex".
@@ -1476,11 +1473,12 @@ export function classifyComplexity(messages: Array<{ role?: string; content?: un
   if (andCount >= 3) score += 1;
   if (andCount >= 5) score += 1;
 
-  // Calculate total tokens across ALL messages, not just last user message.
+  // Calculate total tokens across ALL messages + system prompt.
   // For agent workloads (OpenClaw, aider, Claude Code) the last user message is
-  // often tiny while the real complexity lives in the 100K+ token context.
+  // often tiny while the real complexity lives in the 100K+ token system prompt/context.
   const allText = extractMessageText(messages);
-  const totalTokens = Math.ceil(allText.length / 4);
+  const systemLen = systemText?.length ?? 0;
+  const totalTokens = Math.ceil((allText.length + systemLen) / 4);
   // Context size floor — use as a hard signal regardless of last-message score
   if (totalTokens > 80000) score += 5;       // definitely complex (~23K system/tools not counted by scorer)
   else if (totalTokens > 50000) score += 3;  // likely moderate+
@@ -2791,23 +2789,141 @@ async function* pipeOpenAIStream(
 }
 
 /**
- * Parse preferred model string (format: "provider:model")
+ * Unified model resolver — handles all input formats and providers consistently.
+ *
+ * Accepts:
+ *   - Slash-separated: "provider/model" or "provider/provider/model" (openrouter nesting)
+ *   - Colon-separated: "provider:model" (preferred model format)
+ *   - Bare names: "gpt-5.4", "claude-opus-4-6", "sonnet", "haiku"
+ *   - Objects: { provider: string, model: string }
+ *   - Smart aliases: "rp:best", "rp:balanced" (resolved via SMART_ALIASES)
+ *
+ * Provider list is canonical and includes all known providers (anthropic, openai, google,
+ * xai, openrouter, deepseek, groq, codex, ollama, local, mistral, together, fireworks, perplexity).
+ *
+ * Logic:
+ *   1. If defaultProvider given, route everything to that provider (preserve model name as-is)
+ *   2. If object or slash format with explicit provider, use that provider
+ *   3. If colon format, split and validate provider
+ *   4. If bare name, try: SMART_ALIASES → MODEL_MAPPING → prefix matching (claude-*, gpt-*, etc.)
+ *   5. Fallback: null (caller must handle)
  */
-function parsePreferredModel(
-  preferredModel: string
+function resolveModel(
+  input: string | { provider: string; model: string },
+  defaultProvider?: string
 ): { provider: Provider; model: string } | null {
-  const [provider, model] = preferredModel.split(':');
-  if (!provider || !model) return null;
+  const CANONICAL_PROVIDERS: Provider[] = [
+    'anthropic', 'openai', 'google', 'xai', 'openrouter',
+    'deepseek', 'groq', 'codex', 'ollama', 'local',
+    'mistral', 'together', 'fireworks', 'perplexity',
+  ];
 
-  // Validate provider
-  const validProviders: Provider[] = ['openai', 'anthropic', 'google', 'xai', 'openrouter', 'deepseek', 'groq', 'local'];
-  if (!validProviders.includes(provider as Provider)) return null;
+  // If defaultProvider is given, all models route to that provider (used by aggregators)
+  if (defaultProvider) {
+    return { provider: defaultProvider as Provider, model: input instanceof Object ? input.model : input };
+  }
 
-  return { provider: provider as Provider, model };
+  // Handle object input (e.g., from config.routing.complexity)
+  if (typeof input === 'object' && input !== null) {
+    const provider = input.provider as Provider;
+    if (!CANONICAL_PROVIDERS.includes(provider)) {
+      console.warn(`[resolveModel] Unknown provider "${input.provider}", falling back to anthropic`);
+      return { provider: 'anthropic', model: input.model };
+    }
+    return { provider, model: input.model };
+  }
+
+  // Handle string input
+  const modelStr = input as string;
+
+  // Try colon-separated format first: "provider:model"
+  if (modelStr.includes(':') && !modelStr.startsWith('http')) {
+    const colonIdx = modelStr.indexOf(':');
+    const providerPart = modelStr.slice(0, colonIdx);
+    const modelPart = modelStr.slice(colonIdx + 1);
+    if (providerPart && modelPart && CANONICAL_PROVIDERS.includes(providerPart as Provider)) {
+      return { provider: providerPart as Provider, model: modelPart };
+    }
+    // Colon might be inside a smart alias (e.g., "rp:best"), continue to resolve it below
+  }
+
+  // Try slash-separated format: "provider/model" (handles openrouter/anthropic/claude-... nesting)
+  if (modelStr.includes('/')) {
+    const slashIdx = modelStr.indexOf('/');
+    const providerPart = modelStr.slice(0, slashIdx);
+    const modelPart = modelStr.slice(slashIdx + 1);
+
+    if (CANONICAL_PROVIDERS.includes(providerPart as Provider)) {
+      // Handle special case: strip openrouter/ prefix
+      let finalModel = modelPart;
+      if (providerPart === 'openrouter' && modelPart.startsWith('openrouter/')) {
+        finalModel = modelPart.slice('openrouter/'.length);
+      }
+      // Handle special case: extract model from provider/model nesting (e.g., ollama/ prefix)
+      if ((providerPart === 'ollama' || providerPart === 'openrouter') && modelPart.includes('/')) {
+        // Keep the full nesting: openrouter/anthropic/claude-... or ollama/llama3
+        finalModel = modelPart;
+      }
+      return { provider: providerPart as Provider, model: finalModel };
+    }
+    // Unrecognized provider, continue to bare name resolution
+  }
+
+  // Bare name: resolve aliases and prefix matching
+  // 1. Try smart aliases (rp:best, rp:fast, etc.)
+  const resolved = resolveModelAlias(modelStr);
+  if (SMART_ALIASES[resolved]) {
+    return SMART_ALIASES[resolved];
+  }
+
+  // 2. Try MODEL_MAPPING (alias definitions)
+  if (MODEL_MAPPING[resolved]) {
+    return MODEL_MAPPING[resolved];
+  }
+  if (resolved !== modelStr && MODEL_MAPPING[modelStr]) {
+    return MODEL_MAPPING[modelStr];
+  }
+
+  // 3. Prefix matching for bare names
+  // Anthropic
+  if (modelStr.startsWith('claude-') || modelStr.startsWith('claude')) {
+    return { provider: 'anthropic', model: modelStr };
+  }
+
+  // OpenAI (gpt-*, o1-*, o3-*, chatgpt-*, text-*, dall-e-*, whisper-*, tts-*)
+  if (
+    modelStr.startsWith('gpt-') || modelStr.startsWith('gpt') ||
+    modelStr.startsWith('o1-') || modelStr.startsWith('o3-') || modelStr.startsWith('o4-') ||
+    modelStr.startsWith('chatgpt-') || modelStr.startsWith('text-') ||
+    modelStr.startsWith('dall-e') || modelStr.startsWith('whisper') || modelStr.startsWith('tts-')
+  ) {
+    return { provider: 'openai', model: modelStr };
+  }
+
+  // Google
+  if (modelStr.startsWith('gemini-') || modelStr.startsWith('gemini') || modelStr.startsWith('palm-')) {
+    return { provider: 'google', model: modelStr };
+  }
+
+  // xAI
+  if (modelStr.startsWith('grok-') || modelStr.startsWith('grok')) {
+    return { provider: 'xai', model: modelStr };
+  }
+
+  // DeepSeek (deepseek-* routes to deepseek provider, not openrouter)
+  if (modelStr.startsWith('deepseek-') || modelStr === 'deepseek') {
+    return { provider: 'deepseek', model: modelStr };
+  }
+
+  // Groq (groq-* routes to groq provider, not openrouter)
+  if (modelStr.startsWith('groq-') || modelStr === 'groq') {
+    return { provider: 'groq', model: modelStr };
+  }
+
+  // No match
+  return null;
 }
 
-/**
- * Resolve explicit model name to provider and model.
 /**
  * Add provider prefix to bare model names for aggregator routing (e.g., OpenRouter).
  * Complexity routing produces bare names like 'claude-sonnet-4-6' — aggregators need
@@ -2841,96 +2957,20 @@ function addProviderPrefix(model: string, detectedProvider: string): string {
 }
 
 /**
+ * Exported for backwards compatibility in tests. Prefer resolveModel() for new code.
  * When `defaultProvider` is set, ALL models are routed to that provider
  * regardless of model name prefix — the model name is preserved as-is
  * so OpenRouter receives the full `anthropic/claude-sonnet-4-6` format.
  */
+function resolveConfigModel(modelName: string, defaultProvider?: string): { provider: Provider; model: string } | null {
+  return resolveModel(modelName, defaultProvider);
+}
+
 export function resolveExplicitModel(
   modelName: string,
   defaultProvider?: string
 ): { provider: Provider; model: string } | null {
-  if (defaultProvider) {
-    return { provider: defaultProvider as Provider, model: modelName };
-  }
-
-  // Resolve aliases first (e.g., relayplane:auto → rp:balanced)
-  const resolvedAlias = resolveModelAlias(modelName);
-
-  // Check SMART_ALIASES (rp:best, rp:fast, etc.)
-  if (SMART_ALIASES[resolvedAlias]) {
-    return SMART_ALIASES[resolvedAlias];
-  }
-
-  // Check MODEL_MAPPING (aliases)
-  if (MODEL_MAPPING[resolvedAlias]) {
-    return MODEL_MAPPING[resolvedAlias];
-  }
-
-  // If alias was resolved but not in mappings, try original name
-  if (resolvedAlias !== modelName && MODEL_MAPPING[modelName]) {
-    return MODEL_MAPPING[modelName];
-  }
-
-  // Anthropic models (claude-*)
-  if (modelName.startsWith('claude-')) {
-    return { provider: 'anthropic', model: modelName };
-  }
-
-  // OpenAI models (gpt-*, o1-*, chatgpt-*, text-*, dall-e-*, whisper-*, tts-*)
-  if (
-    modelName.startsWith('gpt-') ||
-    modelName.startsWith('o1-') ||
-    modelName.startsWith('o3-') ||
-    modelName.startsWith('chatgpt-') ||
-    modelName.startsWith('text-') ||
-    modelName.startsWith('dall-e') ||
-    modelName.startsWith('whisper') ||
-    modelName.startsWith('tts-')
-  ) {
-    return { provider: 'openai', model: modelName };
-  }
-
-  // Google models (gemini-*, palm-*)
-  if (modelName.startsWith('gemini-') || modelName.startsWith('palm-')) {
-    return { provider: 'google', model: modelName };
-  }
-
-  // xAI models (grok-*)
-  if (modelName.startsWith('grok-')) {
-    return { provider: 'xai', model: modelName };
-  }
-
-  // OpenRouter/DeepSeek/Groq models
-  if (modelName.startsWith('openrouter/')) {
-    // Strip the "openrouter/" prefix — OpenRouter expects just "google/gemini-2.5-pro" not "openrouter/google/gemini-2.5-pro"
-    return { provider: 'openrouter', model: modelName.slice('openrouter/'.length) };
-  }
-  if (modelName.startsWith('deepseek-') || modelName.startsWith('groq-')) {
-    return { provider: 'openrouter', model: modelName };
-  }
-
-  // Ollama models: "ollama/llama3.2" or direct model names when Ollama config exists
-  if (modelName.startsWith('ollama/')) {
-    return { provider: 'ollama', model: modelName.slice('ollama/'.length) };
-  }
-
-  // Provider-prefixed format: "anthropic/claude-3-5-sonnet-latest"
-  if (modelName.includes('/')) {
-    const [provider, model] = modelName.split('/');
-    const validProviders: Provider[] = ['openai', 'anthropic', 'google', 'xai', 'openrouter', 'deepseek', 'groq', 'local', 'ollama'];
-    if (provider && model && validProviders.includes(provider as Provider)) {
-      return { provider: provider as Provider, model };
-    }
-  }
-
-  return null;
-}
-
-function resolveConfigModel(modelName: string, defaultProvider?: string): { provider: Provider; model: string } | null {
-  if (defaultProvider) {
-    return { provider: defaultProvider as Provider, model: modelName };
-  }
-  return resolveExplicitModel(modelName) ?? parsePreferredModel(modelName);
+  return resolveModel(modelName, defaultProvider);
 }
 
 function extractResponseTextAuto(responseData: Record<string, unknown>): string {
@@ -3946,15 +3986,27 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   // Initialize mesh learning layer
   const meshConfig = getMeshConfig();
   const userConfig = loadUserConfig();
-  const meshHandle: MeshHandle = _meshHandle = initMeshLayer(
-    {
-      enabled: meshConfig.enabled,
-      endpoint: meshConfig.endpoint,
-      sync_interval_ms: meshConfig.sync_interval_ms,
-      contribute: meshConfig.contribute,
-    },
-    userConfig.api_key,
-  );
+  let meshHandle: MeshHandle;
+  try {
+    meshHandle = _meshHandle = initMeshLayer(
+      {
+        enabled: meshConfig.enabled,
+        endpoint: meshConfig.endpoint,
+        sync_interval_ms: meshConfig.sync_interval_ms,
+        contribute: meshConfig.contribute,
+      },
+      userConfig.api_key,
+    );
+  } catch (err) {
+    console.error('[RelayPlane] Failed to initialize mesh layer:', err instanceof Error ? err.message : err);
+    // Return a no-op mesh handle so the proxy can continue
+    meshHandle = _meshHandle = {
+      captureRequest() {},
+      getStats() { return { enabled: false, atoms_local: 0, atoms_synced: 0, last_sync: null, endpoint: '' }; },
+      forceSync() { return Promise.resolve({ pushed: 0, pulled: 0, deduped: 0, errors: [], timestamp: new Date().toISOString() }); },
+      stop() {},
+    };
+  }
 
   // Initialize budget manager
   const budgetManager = getBudgetManager(proxyConfig.budget);
@@ -5405,10 +5457,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // Always classify — needed for taskType display, telemetry, and routing decisions
       // even in passthrough mode we want accurate task type data
       if (messages.length > 0) {
+        const sysRaw = requestBody['system'];
+        const sysText = typeof sysRaw === 'string' ? sysRaw
+          : Array.isArray(sysRaw) ? (sysRaw as Array<{type?:string;text?:string}>).filter(b=>b.type==='text').map(b=>b.text??'').join(' ')
+          : '';
         promptText = extractMessageText(messages);
         taskType = inferTaskType(promptText);
         confidence = getInferenceConfidence(promptText, taskType);
-        complexity = classifyComplexity(messages);
+        complexity = classifyComplexity(messages, sysText);
         log(`Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`);
       }
 
@@ -5430,8 +5486,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         if (proxyConfig.routing?.complexity?.enabled) {
           const complexityVal = proxyConfig.routing?.complexity?.[complexity];
           if (complexityVal != null) {
-            const parsed = parseComplexityModel(complexityVal);
-            selectedModel = `${parsed.provider}/${parsed.model}`;
+            const parsed = resolveModel(complexityVal);
+            if (parsed) {
+              selectedModel = `${parsed.provider}/${parsed.model}`;
+            }
           }
         } else {
           selectedModel = getCascadeModels(proxyConfig)[0] || getCostModel(proxyConfig);
@@ -5473,15 +5531,22 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           if (proxyConfig.routing?.complexity?.enabled) {
             const complexityVal = proxyConfig.routing?.complexity?.[complexity];
             if (complexityVal != null) {
-              const parsed = parseComplexityModel(complexityVal);
-              selectedModel = `${parsed.provider}/${parsed.model}`;
-              log(`Complexity routing: ${complexity} → ${parsed.provider}/${parsed.model}`);
+              const parsed = resolveModel(complexityVal);
+              if (parsed) {
+                const routedModel = preserveOpusVersion(requestedModel, parsed.model);
+                if (routedModel !== parsed.model) {
+                  log(`Complexity routing: ${complexity} → ${parsed.provider}/${routedModel} (Opus version from request)`);
+                } else {
+                  log(`Complexity routing: ${complexity} → ${parsed.provider}/${routedModel}`);
+                }
+                selectedModel = `${parsed.provider}/${routedModel}`;
+              }
             }
           }
           // Fall back to learned routing rules (non-default only)
           if (!selectedModel) {
             const rule = relay.routing.get(taskType);
-            const parsedRule = rule?.preferredModel ? parsePreferredModel(rule.preferredModel) : null;
+            const parsedRule = rule?.preferredModel ? resolveModel(rule.preferredModel) : null;
             if (parsedRule?.provider === 'anthropic' && rule?.source !== 'default') {
               selectedModel = parsedRule.model;
             }
@@ -5531,9 +5596,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const allText = extractMessageText(messages);
         const estimatedTokens = Math.ceil(allText.length / 4);
         if (estimatedTokens > 180000) { // 180K buffer below 200K limit
-          const opusModel = proxyConfig.routing?.complexity?.complex
-            ? parseComplexityModel(proxyConfig.routing.complexity.complex).model
-            : 'claude-opus-4-6';
+          const parsed = proxyConfig.routing?.complexity?.complex
+            ? resolveModel(proxyConfig.routing.complexity.complex)
+            : null;
+          const opusModel = preserveOpusVersion(requestedModel, parsed?.model ?? 'claude-opus-4-6');
           log(`Context guard: ${estimatedTokens} estimated tokens exceeds Sonnet 200K limit → upgrading to ${opusModel}`);
           targetModel = opusModel;
         }
@@ -5544,6 +5610,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       const effectiveCtx = ctx;
 
       // ── Ollama native routing: intercept before cloud dispatch ──
+      let ollamaHandled = false;
       if (
         !useCascade &&
         _activeOllamaConfig &&
@@ -5578,6 +5645,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                   'X-RelayPlane-Original-Model': originalModel ?? 'unknown',
                 };
                 res.writeHead(200, streamHeaders);
+                ollamaHandled = true;
+
                 if (ollamaRes.body) {
                   const reader = ollamaRes.body.getReader();
                   try {
@@ -5586,6 +5655,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                       if (done) break;
                       res.write(value);
                     }
+                  } catch (writeErr) {
+                    const writeErrMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+                    log(`Ollama native stream write error: ${writeErrMsg} — request aborted by client`);
+                    res.destroy();
+                    return;
                   } finally {
                     reader.releaseLock();
                   }
@@ -5626,11 +5700,23 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err);
             log(`Ollama native error: ${errMsg} — falling back to cloud`);
+            // If headers were already sent, we can't continue — destroy and return
+            if (ollamaHandled && res.headersSent) {
+              res.destroy();
+              return;
+            }
           }
         } else {
           log(`Ollama not available: ${health.error} — falling back to cloud`);
         }
         // Fall through: reset to cloud routing (original target stays as-is)
+      }
+
+      // Safety guard: if headers were already sent (e.g., by Ollama streaming error),
+      // don't try to send them again
+      if (res.headersSent) {
+        log('Headers already sent, cannot continue with further routing');
+        return;
       }
 
       if (
@@ -5666,7 +5752,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
       // ── Session budget check (only when X-Claude-Code-Session-Id is present) ──
       let nativeSessionBudgetResult: SessionBudgetCheckResult | null = null;
-      if (nativeSessionSource === 'claude-code') {
+      if (nativeSessionSource === 'claude-code' && proxyConfig.budget?.enabled !== false) {
         nativeSessionBudgetResult = budgetManager.checkSessionBudget(nativeSessionId, targetModel || requestedModel);
         if (!nativeSessionBudgetResult.allowed) {
           res.writeHead(429, { 'Content-Type': 'application/json' });
@@ -5810,7 +5896,83 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // When complexity routing resolves to a non-Anthropic provider, convert
       // the Anthropic body to OpenAI format, dispatch, and convert back.
       try { fs.appendFileSync(path.join(os.homedir(), '.relayplane', 'sanitize-debug.log'), `${new Date().toISOString()} [ROUTE-DEBUG] Pre-dispatch: targetProvider=${targetProvider} targetModel=${targetModel} useCascade=${useCascade} hasEffort=${'effort' in requestBody}\n`); } catch {}
-      if (targetProvider !== 'anthropic' && targetProvider !== 'ollama') {
+      if (targetProvider === 'codex') {
+        // ── Codex OAuth provider (Responses API via OpenAI SDK) ──
+        try {
+          log(`Codex dispatch: ${targetProvider}/${targetModel} (complexity: ${complexity})`);
+          const codexResult = await forwardToResponsesAPI(
+            requestBody as CodexAnthropicBody,
+            targetModel,
+            { sessionId: nativeSessionId },
+          );
+
+          if (!codexResult.ok) {
+            log(`Codex request failed: ${codexResult.error}, falling back to Anthropic`);
+            targetProvider = 'anthropic';
+            targetModel = originalModel ?? 'claude-sonnet-4-20250514';
+          } else {
+            const _codexMsgId = `msg_${Date.now().toString(36)}`;
+            const _reportedModel = originalModel ?? requestedModel ?? targetModel;
+
+            if (isStreaming) {
+              // Pipe SDK stream → Anthropic SSE → client
+              const streamRpHeaders = buildRelayPlaneResponseHeaders(
+                targetModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
+              );
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                ...streamRpHeaders,
+              });
+              const { stream: _codexStream, getUsage: _getCodexUsage } =
+                convertResponsesAPIStreamToAnthropic(codexResult.sdkStream, _codexMsgId, _reportedModel);
+              for await (const anthropicChunk of _codexStream) {
+                res.write(anthropicChunk);
+              }
+              res.end();
+              const _codexUsage = _getCodexUsage();
+              const durationMs = Date.now() - startTime;
+              logRequest(originalModel ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, false, taskType, complexity, nativeAgentFingerprint, nativeExplicitAgentId);
+              updateLastHistoryEntry(_codexUsage.inputTokens, _codexUsage.outputTokens, 0, _reportedModel);
+              log(`Codex stream completed: ${targetProvider}/${targetModel} in ${durationMs}ms`);
+              return;
+            } else {
+              // Collect stream into non-streaming Anthropic response
+              let outputText = '';
+              let completedResponse: Record<string, unknown> | undefined;
+              for await (const event of codexResult.sdkStream) {
+                if ((event as any).type === 'response.output_text.delta') {
+                  outputText += (event as any).delta ?? '';
+                }
+                if ((event as any).type === 'response.completed') {
+                  completedResponse = (event as any).response as Record<string, unknown>;
+                }
+              }
+              const responseData = completedResponse ?? {};
+              (responseData as any).output_text = outputText;
+              const anthropicResponse = convertResponsesAPIResponseToAnthropic(responseData, _codexMsgId, _reportedModel);
+
+              const rpHeaders = buildRelayPlaneResponseHeaders(
+                targetModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
+              );
+              res.writeHead(200, { 'Content-Type': 'application/json', ...rpHeaders });
+              res.end(JSON.stringify(anthropicResponse));
+
+              const durationMs = Date.now() - startTime;
+              const usage = (anthropicResponse.usage as any) ?? { input_tokens: 0, output_tokens: 0 };
+              logRequest(originalModel ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, false, taskType, complexity, nativeAgentFingerprint, nativeExplicitAgentId);
+              updateLastHistoryEntry(usage.input_tokens, usage.output_tokens, 0, originalModel ?? 'unknown');
+              log(`Codex non-streaming completed: ${targetProvider}/${targetModel} in ${durationMs}ms`);
+              return;
+            }
+          }
+        } catch (err) {
+          log(`Codex error: ${err instanceof Error ? err.message : String(err)}, falling back to Anthropic`);
+          targetProvider = 'anthropic';
+          targetModel = originalModel ?? 'claude-sonnet-4-20250514';
+        }
+      } else if (targetProvider !== 'anthropic' && targetProvider !== 'ollama') {
         const altApiKeyResult = resolveProviderApiKey(targetProvider as Provider, ctx, undefined);
         if (altApiKeyResult.error) {
           // No API key for this provider — fall back to Anthropic passthrough
@@ -5974,6 +6136,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           const _nativeReqBody: Record<string, unknown> = { ...requestBody, model: finalModel };
           try { fs.appendFileSync(path.join(os.homedir(), '.relayplane', 'sanitize-debug.log'), `${new Date().toISOString()} [ROUTE-DEBUG] Entering gateway: model=${finalModel} hasEffort=${'effort' in _nativeReqBody} isRerouted=${isRerouted}\n`); } catch {}
 
+          // ── Retryable status codes: 529 (overloaded), 503 (service unavailable) ──
+          const RETRYABLE_STATUSES = new Set([529, 503]);
+          const MAX_RETRIES = 5;
+          const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 10000]; // exponential backoff, cap at 10s
+
           let providerResponse = await forwardNativeAnthropicRequest(
             _nativeReqBody,
             _nativeReqCtx,
@@ -5981,6 +6148,18 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             modelAuth.isMax,
             isRerouted
           );
+
+          // ── Retry loop for transient errors (same model) ──
+          for (let attempt = 0; attempt < MAX_RETRIES && !providerResponse.ok && RETRYABLE_STATUSES.has(providerResponse.status); attempt++) {
+            // Consume the error body so the connection is freed
+            await providerResponse.text().catch(() => {});
+            const delay = RETRY_DELAYS_MS[attempt] ?? 2000;
+            log(`Retry ${attempt + 1}/${MAX_RETRIES}: ${finalModel} returned ${providerResponse.status}, waiting ${delay}ms`);
+            await new Promise(r => setTimeout(r, delay));
+            providerResponse = await forwardNativeAnthropicRequest(
+              _nativeReqBody, _nativeReqCtx, modelAuth.apiKey, modelAuth.isMax, isRerouted
+            );
+          }
 
           if (!providerResponse.ok) {
             const errorPayload = (await providerResponse.json()) as Record<string, unknown>;
@@ -6004,6 +6183,43 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
             if (proxyConfig.reliability?.cooldowns?.enabled && providerResponse.status !== 401 && providerResponse.status !== 403) {
               cooldownManager.recordFailure(targetProvider, JSON.stringify(errorPayload));
+            }
+
+            // ── Reroute fallback: retries exhausted on rerouted model, try original ──
+            if (
+              isRerouted &&
+              originalModel &&
+              RETRYABLE_STATUSES.has(providerResponse.status) &&
+              finalModel !== originalModel
+            ) {
+              log(`Rerouted model ${finalModel} returned ${providerResponse.status} after retries, falling back to original ${originalModel}`);
+              const fallbackBody: Record<string, unknown> = { ...requestBody, model: originalModel };
+              const fallbackAuth = getAuthForModel(originalModel, proxyConfig.auth, useAnthropicEnvKey);
+              const fallbackResponse = await forwardNativeAnthropicRequest(
+                fallbackBody, ctx, fallbackAuth.apiKey, fallbackAuth.isMax, false
+              );
+              if (fallbackResponse.ok) {
+                const fallbackData = (await fallbackResponse.json()) as Record<string, unknown>;
+                const fallbackRpHeaders = buildRelayPlaneResponseHeaders(
+                  originalModel, originalModel, complexity, targetProvider, `${routingMode}+overload-fallback`
+                );
+                const fallbackStrippedHeaders: Record<string, string> = {};
+                if (_strippedThinking) fallbackStrippedHeaders['X-RelayPlane-Stripped-Thinking'] = 'true';
+                if (_strippedBetaFlags.length > 0) fallbackStrippedHeaders['X-RelayPlane-Stripped-Beta'] = _strippedBetaFlags.join(',');
+                res.writeHead(200, {
+                  'Content-Type': 'application/json',
+                  'X-RelayPlane-Fallback': `${finalModel}->${originalModel}`,
+                  ...fallbackRpHeaders,
+                  ...fallbackStrippedHeaders,
+                });
+                res.end(JSON.stringify(fallbackData));
+                const fbDurationMs = Date.now() - startTime;
+                logRequest(originalModel, originalModel, targetProvider, fbDurationMs, true, `${routingMode}+overload-fallback`, undefined, taskType, complexity, nativeAgentFingerprint, nativeExplicitAgentId);
+                log(`Overload-fallback succeeded: ${originalModel} in ${fbDurationMs}ms`);
+                return;
+              }
+              // Fallback also failed — continue to original error path
+              log(`Overload-fallback to ${originalModel} also failed (${fallbackResponse.status})`);
             }
 
             // ── Cross-provider cascade for /v1/messages path (GH #38) ──
@@ -6710,10 +6926,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
     // Always classify — taskType is needed for display, routing decisions, and telemetry
     if (request.messages && request.messages.length > 0) {
+      const sysRaw = request['system'];
+      const sysText = typeof sysRaw === 'string' ? sysRaw
+        : Array.isArray(sysRaw) ? (sysRaw as Array<{type?:string;text?:string}>).filter((b: {type?:string;text?:string})=>b.type==='text').map((b: {type?:string;text?:string})=>b.text??'').join(' ')
+        : '';
       promptText = extractPromptText(request.messages);
       taskType = inferTaskType(promptText);
       confidence = getInferenceConfidence(promptText, taskType);
-      complexity = classifyComplexity(request.messages);
+      complexity = classifyComplexity(request.messages, sysText);
       log(`Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`);
     }
 
@@ -6769,16 +6989,23 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         if (proxyConfig.routing?.complexity?.enabled) {
           const complexityVal = proxyConfig.routing?.complexity?.[complexity];
           if (complexityVal != null) {
-            const parsed = parseComplexityModel(complexityVal);
-            selectedModel = `${parsed.provider}/${parsed.model}`;
-            log(`Complexity routing: ${complexity} → ${parsed.provider}/${parsed.model}`);
+            const parsed = resolveModel(complexityVal);
+            if (parsed) {
+              const routedModel = preserveOpusVersion(requestedModel, parsed.model);
+              if (routedModel !== parsed.model) {
+                log(`Complexity routing: ${complexity} → ${parsed.provider}/${routedModel} (Opus version from request)`);
+              } else {
+                log(`Complexity routing: ${complexity} → ${parsed.provider}/${routedModel}`);
+              }
+              selectedModel = `${parsed.provider}/${routedModel}`;
+            }
           }
         }
         // Fall back to learned routing rules (non-default only)
         if (!selectedModel && !targetModel) {
           const rule = relay.routing.get(taskType);
           if (rule && rule.preferredModel && rule.source !== 'default') {
-            const parsedRule = parsePreferredModel(rule.preferredModel);
+            const parsedRule = resolveModel(rule.preferredModel);
             if (parsedRule) {
               targetProvider = parsedRule.provider;
               targetModel = parsedRule.model;
@@ -6826,9 +7053,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       const allText = extractMessageText(request.messages as Array<{ role?: string; content?: unknown }>);
       const estimatedTokens = Math.ceil(allText.length / 4);
       if (estimatedTokens > 180000) {
-        const opusModel = proxyConfig.routing?.complexity?.complex
-          ? parseComplexityModel(proxyConfig.routing.complexity.complex).model
-          : 'claude-opus-4-6';
+        const parsed = proxyConfig.routing?.complexity?.complex
+          ? resolveModel(proxyConfig.routing.complexity.complex)
+          : null;
+        const opusModel = preserveOpusVersion(requestedModel, parsed?.model ?? 'claude-opus-4-6');
         log(`Context guard: ${estimatedTokens} estimated tokens exceeds Sonnet 200K limit → upgrading to ${opusModel}`);
         targetModel = opusModel;
       }
@@ -7317,6 +7545,36 @@ async function executeNonStreamingProviderRequest(
         };
       }
       responseData = ollamaResult.data!;
+      break;
+    }
+    case 'codex': {
+      const anthropicBody: CodexAnthropicBody = {
+        model: targetModel,
+        messages: request.messages.map((m) => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content as string,
+        })),
+        max_tokens: request.max_tokens,
+        temperature: request.temperature,
+      };
+      if (request.tools && request.tools.length > 0) {
+        anthropicBody.tools = request.tools as any;
+      }
+
+      const codexResult = await forwardToResponsesAPI(anthropicBody, targetModel);
+      if (!codexResult.ok) {
+        return { responseData: { error: codexResult.error }, ok: false, status: 502 };
+      }
+      // Collect stream into complete response (Codex requires streaming)
+      let outputText = '';
+      let completedResp: Record<string, unknown> | undefined;
+      for await (const event of codexResult.sdkStream) {
+        if ((event as any).type === 'response.output_text.delta') outputText += (event as any).delta ?? '';
+        if ((event as any).type === 'response.completed') completedResp = (event as any).response;
+      }
+      const respData = completedResp ?? {};
+      (respData as any).output_text = outputText;
+      responseData = convertResponsesAPIResponseToAnthropic(respData, `msg_${Date.now().toString(36)}`, targetModel);
       break;
     }
     default: {

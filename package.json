@@ -22,7 +22,13 @@
     "harness:v1.7": "bash ./scripts/v1.7-harness.sh",
     "prepublishOnly": "npm run build",
     "test:integration": "vitest run __tests__/integration/",
-    "test:e2e": "vitest run test/e2e/"
+    "test:e2e": "vitest run test/e2e/",
+    "deploy": "node scripts/deploy.js release",
+    "deploy:validate": "node scripts/deploy.js validate",
+    "deploy:stage-config": "node scripts/deploy.js stage-config",
+    "deploy:rollback": "node scripts/deploy.js rollback",
+    "deploy:status": "node scripts/deploy.js status",
+    "deploy:dry-run": "node scripts/deploy.js release --dry-run"
   },
   "keywords": [
     "relayplane",

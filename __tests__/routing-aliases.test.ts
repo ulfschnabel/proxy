@@ -5,6 +5,7 @@ import {
   resolveModelAlias,
   getAvailableModelNames,
   MODEL_MAPPING,
+  preserveOpusVersion,
 } from '../src/standalone-proxy.js';
 
 describe('RELAYPLANE_ALIASES', () => {
@@ -99,5 +100,27 @@ describe('MODEL_MAPPING', () => {
 
   it('should have updated opus pointing to claude-opus-4', () => {
     expect(MODEL_MAPPING['opus'].model).toContain('claude-opus-4');
+  });
+});
+
+describe('preserveOpusVersion', () => {
+  it('preserves opus-4-7 when routing picks opus-4-6', () => {
+    expect(preserveOpusVersion('claude-opus-4-7', 'claude-opus-4-6')).toBe('claude-opus-4-7');
+  });
+
+  it('preserves opus-4-6 when routing picks opus-4-6', () => {
+    expect(preserveOpusVersion('claude-opus-4-6', 'claude-opus-4-6')).toBe('claude-opus-4-6');
+  });
+
+  it('does not alter sonnet when routing picks sonnet', () => {
+    expect(preserveOpusVersion('claude-opus-4-7', 'claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
+  });
+
+  it('does not alter when request is sonnet and routing picks opus', () => {
+    expect(preserveOpusVersion('claude-sonnet-4-6', 'claude-opus-4-6')).toBe('claude-opus-4-6');
+  });
+
+  it('handles future opus versions', () => {
+    expect(preserveOpusVersion('claude-opus-5-0', 'claude-opus-4-6')).toBe('claude-opus-5-0');
   });
 });

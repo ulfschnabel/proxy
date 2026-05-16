@@ -19,6 +19,7 @@ describe('Complexity routing vs default routing rules (standalone-proxy)', () =>
   });
 
   afterEach(() => {
+    store.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 

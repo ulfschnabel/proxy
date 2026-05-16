@@ -108,6 +108,7 @@ export class ProcessManager extends EventEmitter {
     try {
       const child = spawn(this.command, this.args, {
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
         env: { ...process.env, ...this.env },
       });
 
@@ -190,10 +191,6 @@ export class ProcessManager extends EventEmitter {
         this.spawnChild();
       }
     }, this.currentDelay);
-
-    if (this.restartTimer && typeof this.restartTimer === 'object' && 'unref' in this.restartTimer) {
-      this.restartTimer.unref();
-    }
 
     // Exponential backoff
     this.currentDelay = Math.min(this.currentDelay * 2, this.maxRestartDelayMs);
