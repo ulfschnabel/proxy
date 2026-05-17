@@ -126,62 +126,110 @@ export function inferTaskType(
 }
 
 /**
- * Estimate cost based on model and token counts
- * Pricing as of 2024 (USD per 1M tokens)
+ * Estimate cost based on model and token counts.
+ * Pricing in USD per 1M tokens.
+ *
+ * Exact model IDs are checked first, then tier-based fallback
+ * matches by name pattern (opus/sonnet/haiku/gpt/gemini) so
+ * new model versions don't silently fall to the $1/$3 default.
  */
 export const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  // Anthropic — versioned IDs
+  // Anthropic Opus (all versions: 4-5, 4-6, 4-7, etc.)
   'claude-opus-4-20250514': { input: 15.0, output: 75.0 },
+  'claude-opus-4-7': { input: 15.0, output: 75.0 },
+  'claude-opus-4-6': { input: 15.0, output: 75.0 },
+  'claude-opus-4-5': { input: 15.0, output: 75.0 },
+  'claude-opus-4-latest': { input: 15.0, output: 75.0 },
+  'claude-opus-4': { input: 15.0, output: 75.0 },
+  'claude-3-opus-20240229': { input: 15.0, output: 75.0 },
+
+  // Anthropic Sonnet
   'claude-sonnet-4-20250514': { input: 3.0, output: 15.0 },
+  'claude-sonnet-4-6': { input: 3.0, output: 15.0 },
+  'claude-sonnet-4-5': { input: 3.0, output: 15.0 },
+  'claude-sonnet-4-latest': { input: 3.0, output: 15.0 },
+  'claude-sonnet-4': { input: 3.0, output: 15.0 },
   'claude-3-7-sonnet-20250219': { input: 3.0, output: 15.0 },
+  'claude-3-7-sonnet-latest': { input: 3.0, output: 15.0 },
+  'claude-3-7-sonnet': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet-20241022': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet-20240620': { input: 3.0, output: 15.0 },
-  'claude-3-5-haiku-20241022': { input: 0.8, output: 4.0 },
-  'claude-3-opus-20240229': { input: 15.0, output: 75.0 },
-  'claude-3-sonnet-20240229': { input: 3.0, output: 15.0 },
-  'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
-  // Anthropic — generation-versioned aliases (e.g. claude-opus-4-6 = Opus 4 snapshot 6)
-  'claude-opus-4-6': { input: 15.0, output: 75.0 },
-  'claude-sonnet-4-6': { input: 3.0, output: 15.0 },
-  'claude-haiku-4-6': { input: 0.8, output: 4.0 },
-  'claude-opus-4-5': { input: 15.0, output: 75.0 },
-  'claude-sonnet-4-5': { input: 3.0, output: 15.0 },
-  'claude-haiku-4-5': { input: 0.8, output: 4.0 },
-  // Anthropic — -latest aliases (resolve to same tier)
-  'claude-opus-4-latest': { input: 15.0, output: 75.0 },
-  'claude-sonnet-4-latest': { input: 3.0, output: 15.0 },
-  'claude-3-7-sonnet-latest': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet-latest': { input: 3.0, output: 15.0 },
-  'claude-3-5-haiku-latest': { input: 0.8, output: 4.0 },
-  'claude-3-haiku-latest': { input: 0.25, output: 1.25 },
-  // Anthropic — short aliases used in proxy MODEL_MAPPING
-  'claude-opus-4': { input: 15.0, output: 75.0 },
-  'claude-sonnet-4': { input: 3.0, output: 15.0 },
-  'claude-haiku-4': { input: 0.8, output: 4.0 },
-  'claude-3-7-sonnet': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet': { input: 3.0, output: 15.0 },
-  'claude-3-5-haiku': { input: 0.8, output: 4.0 },
-  
+  'claude-3-sonnet-20240229': { input: 3.0, output: 15.0 },
+
+  // Anthropic Haiku
+  'claude-haiku-4-5-20251001': { input: 1.0, output: 5.0 },
+  'claude-haiku-4-6': { input: 1.0, output: 5.0 },
+  'claude-haiku-4-5': { input: 1.0, output: 5.0 },
+  'claude-haiku-4': { input: 1.0, output: 5.0 },
+  'claude-3-5-haiku-20241022': { input: 1.0, output: 5.0 },
+  'claude-3-5-haiku-latest': { input: 1.0, output: 5.0 },
+  'claude-3-5-haiku': { input: 1.0, output: 5.0 },
+  'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
+  'claude-3-haiku-latest': { input: 0.25, output: 1.25 },
+
   // OpenAI
   'gpt-4o': { input: 2.5, output: 10.0 },
   'gpt-4o-mini': { input: 0.15, output: 0.60 },
   'gpt-4.1': { input: 2.0, output: 8.0 },
+  'gpt-4.1-mini': { input: 0.40, output: 1.60 },
   'gpt-4-turbo': { input: 10.0, output: 30.0 },
   'gpt-4': { input: 30.0, output: 60.0 },
   'gpt-3.5-turbo': { input: 0.5, output: 1.5 },
+  'o3': { input: 10.0, output: 40.0 },
+  'o3-mini': { input: 1.10, output: 4.40 },
+  'o4-mini': { input: 1.10, output: 4.40 },
 
   // Google
   'gemini-1.5-pro': { input: 1.25, output: 5.0 },
   'gemini-1.5-flash': { input: 0.075, output: 0.30 },
   'gemini-2.0-flash': { input: 0.10, output: 0.40 },
   'gemini-2.5-pro': { input: 1.25, output: 10.0 },
-  
-  // Default for unknown models
-  'default': { input: 1.0, output: 3.0 },
+  'gemini-2.5-flash': { input: 0.15, output: 0.60 },
+
+  // DeepSeek
+  'deepseek-chat': { input: 0.27, output: 1.10 },
+  'deepseek-reasoner': { input: 0.55, output: 2.19 },
+
+  // Default for truly unknown models
+  'default': { input: 3.0, output: 15.0 },
 };
 
+/**
+ * Tier-based pricing fallback. When a model ID isn't in MODEL_PRICING,
+ * match by name pattern so new versions (opus-4-8, sonnet-4-7, etc.)
+ * get the right tier pricing instead of the default.
+ */
+const TIER_PRICING: Array<{ pattern: RegExp; pricing: { input: number; output: number } }> = [
+  { pattern: /opus/, pricing: { input: 15.0, output: 75.0 } },
+  { pattern: /sonnet/, pricing: { input: 3.0, output: 15.0 } },
+  { pattern: /haiku/, pricing: { input: 1.0, output: 5.0 } },
+  { pattern: /gpt-4o-mini|gpt-4\.1-mini/, pricing: { input: 0.15, output: 0.60 } },
+  { pattern: /gpt-4o|gpt-4\.1/, pricing: { input: 2.5, output: 10.0 } },
+  { pattern: /gpt-4/, pricing: { input: 30.0, output: 60.0 } },
+  { pattern: /gpt-3/, pricing: { input: 0.5, output: 1.5 } },
+  { pattern: /o[34]-mini/, pricing: { input: 1.10, output: 4.40 } },
+  { pattern: /gemini.*flash/, pricing: { input: 0.10, output: 0.40 } },
+  { pattern: /gemini.*pro/, pricing: { input: 1.25, output: 10.0 } },
+  { pattern: /deepseek/, pricing: { input: 0.27, output: 1.10 } },
+];
+
+export function getModelPricing(model: string): { input: number; output: number } {
+  // 1. Exact match
+  if (MODEL_PRICING[model]) return MODEL_PRICING[model];
+  // 2. Strip provider prefix (anthropic/claude-opus-4-7 → claude-opus-4-7)
+  const bare = model.includes('/') ? model.split('/').pop()! : model;
+  if (bare !== model && MODEL_PRICING[bare]) return MODEL_PRICING[bare];
+  // 3. Tier-based pattern match
+  for (const tier of TIER_PRICING) {
+    if (tier.pattern.test(bare)) return tier.pricing;
+  }
+  return MODEL_PRICING['default'];
+}
+
 export function estimateCost(model: string, inputTokens: number, outputTokens: number, cacheCreationTokens?: number, cacheReadTokens?: number): number {
-  const pricing = MODEL_PRICING[model] || MODEL_PRICING['default'];
+  const pricing = getModelPricing(model);
   const outputCost = (outputTokens / 1_000_000) * pricing.output;
 
   if (cacheCreationTokens || cacheReadTokens) {

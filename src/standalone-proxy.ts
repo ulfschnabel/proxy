@@ -157,6 +157,22 @@ function capModelTier(
   return { model: routedModel, provider: routedProvider, capped: false };
 }
 
+/**
+ * Floor: don't route Opus requests below Sonnet.
+ * Opus requests carry parameters (thinking, extended output) that Haiku rejects.
+ * Returns the minimum acceptable model for the requested tier.
+ */
+function floorModelTier(
+  requestedModel: string,
+  routedModel: string,
+  routedProvider: Provider,
+): { model: string; provider: Provider; floored: boolean } {
+  if (requestedModel.includes('opus') && routedModel.includes('haiku')) {
+    return { model: 'claude-sonnet-4-6', provider: 'anthropic' as Provider, floored: true };
+  }
+  return { model: routedModel, provider: routedProvider, floored: false };
+}
+
 /** Beta flags that OAT tokens (sk-ant-oat*) do not support */
 const OAT_UNSUPPORTED_BETA_FLAGS = new Set(['max-tokens-3-5-sonnet-2025-04-14']);
 
@@ -5582,6 +5598,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           targetModel = capped.model;
           targetProvider = capped.provider;
         }
+        const floored = floorModelTier(originalModel, targetModel, targetProvider);
+        if (floored.floored) {
+          log(`Model tier floor: ${targetModel} too low for ${originalModel} — flooring to ${floored.model}`);
+          targetModel = floored.model;
+          targetProvider = floored.provider;
+        }
       }
 
       // Guard: Sonnet has a 200K standard context window. Requests larger than that
@@ -7041,6 +7063,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         log(`Model tier cap: ${targetModel} exceeds requested ${originalRequestedModel} — capping to ${capped.model}`);
         targetModel = capped.model;
         targetProvider = capped.provider;
+      }
+      const floored = floorModelTier(originalRequestedModel, targetModel, targetProvider);
+      if (floored.floored) {
+        log(`Model tier floor: ${targetModel} too low for ${originalRequestedModel} — flooring to ${floored.model}`);
+        targetModel = floored.model;
+        targetProvider = floored.provider;
       }
     }
 
